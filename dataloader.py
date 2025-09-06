@@ -67,7 +67,7 @@ class MultiChannelAudioDataset(Dataset):
             self.audio_files = self._filter_by_duration(self.audio_files, min_file_duration)
             if len(self.audio_files) == 0:
                 raise ValueError(f"No audio files longer than {min_file_duration}s found")
-        
+    
     def _find_audio_files(self) -> tp.List[Path]:
         """Find all audio files in the directory."""
         audio_files = []
@@ -328,7 +328,7 @@ def create_train_test_dataloaders(audio_dir: str,
         batch_size=batch_size,
         shuffle=True,  # Always shuffle training data
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # Disable pin_memory to avoid issues
         drop_last=True
     )
     
@@ -337,7 +337,7 @@ def create_train_test_dataloaders(audio_dir: str,
         batch_size=batch_size,
         shuffle=False,  # Don't shuffle test data
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # Disable pin_memory to avoid issues
         drop_last=True
     )
     

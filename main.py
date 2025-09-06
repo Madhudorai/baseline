@@ -13,7 +13,6 @@ from model_builder import build_encodec_model
 from dataloader import create_train_test_dataloaders
 from discriminators import create_ms_stft_discriminator
 from adversarial_losses import create_adversarial_loss
-from loss_balancer import create_loss_balancer
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +72,8 @@ def setup_wandb():
 
 
 def train_baseline_with_wandb(model, discriminator, train_loader, val_loader, 
-                            model_optimizer, adversarial_loss, loss_balancer,
-                            num_epochs, updates_per_epoch, save_path):
+                            model_optimizer, adversarial_loss,
+                            num_epochs, updates_per_epoch, save_path, device):
     """Custom training loop with comprehensive wandb logging for baseline autoencoder."""
     
     from losses import ReconstructionLoss
@@ -110,8 +109,11 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
             try:
                 # Get batch
                 batch = next(iter(train_loader))
-                if batch.shape[0] != 64:  # Skip incomplete batches
+                if batch.shape[0] != 4:  # Skip incomplete batches
                     continue
+                
+                # Move batch to device
+                batch = batch.to(device)
                 
                 # Forward pass: continuous embeddings → decoder → reconstructed audio
                 continuous_embeddings = model.encode(batch)
@@ -143,16 +145,27 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 time_loss = recon_metrics['time_loss']
                 freq_loss = recon_metrics['freq_loss']
                 
-                # Use loss balancer for gradient balancing
-                losses = {
-                    'time_reconstruction': time_loss,
-                    'freq_reconstruction': freq_loss,
-                    'adversarial': adv_loss,
-                    'feature_matching': feat_loss
-                }
+                # DEBUG: Print raw losses before balancer
+                if update == 0:  # Only print for first update
+                    print(f"DEBUG - Raw losses:")
+                    print(f"  recon_loss: {recon_loss.item():.6f}")
+                    print(f"  time_loss: {time_loss.item():.6f}")
+                    print(f"  freq_loss: {freq_loss.item():.6f}")
+                    print(f"  adv_loss: {adv_loss.item():.6f}")
+                    print(f"  feat_loss: {feat_loss.item():.6f}")
+                    print(f"  batch stats: min={batch.min().item():.6f}, max={batch.max().item():.6f}, mean={batch.mean().item():.6f}")
+                    print(f"  reconstructed stats: min={reconstructed_audio.min().item():.6f}, max={reconstructed_audio.max().item():.6f}, mean={reconstructed_audio.mean().item():.6f}")
                 
-                # The balancer handles gradient computation and backward pass
-                effective_loss = loss_balancer.backward(losses, reconstructed_audio)
+                # Simple weighted loss combination (temporarily disable balancer)
+                effective_loss = (0.1 * time_loss + 1.0 * freq_loss + 3.0 * adv_loss + 3.0 * feat_loss)
+                
+                # Manual backward pass
+                effective_loss.backward()
+                
+                # DEBUG: Print effective loss
+                if update == 0:
+                    print(f"DEBUG - Effective loss: {effective_loss.item():.6f}")
+                    print(f"DEBUG - Loss weights: λt=0.1, λf=1.0, λg=3.0, λfeat=3.0")
                 
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -184,12 +197,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         'global_step': global_step,
                         'update': update
                     })
-                    
-                    # Log balancer metrics
-                    if loss_balancer.metrics:
-                        for name, ratio in loss_balancer.metrics.items():
-                            wandb.log({f'train/balancer_{name}': ratio})
-                
+                                   
                 global_step += 1
                 
             except Exception as e:
@@ -217,8 +225,11 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         val_batches = 0
         with torch.no_grad():
             for batch in val_loader:
-                if batch.shape[0] != 64:  # Skip incomplete batches
+                if batch.shape[0] != 4:  # Skip incomplete batches
                     continue
+                
+                # Move batch to device
+                batch = batch.to(device)
                 
                 # Forward pass
                 continuous_embeddings = model.encode(batch)
@@ -247,11 +258,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 val_metrics['val_adversarial_loss'] += adv_loss.item()
                 val_metrics['val_feature_matching_loss'] += feat_loss.item()
                 
-                # Use same weights as training for validation
-                val_total = (loss_balancer.weights['time_reconstruction'] * time_loss + 
-                           loss_balancer.weights['freq_reconstruction'] * freq_loss +
-                           loss_balancer.weights['adversarial'] * adv_loss + 
-                           loss_balancer.weights['feature_matching'] * feat_loss)
+                # Use paper weights for validation
+                val_total = (0.1 * time_loss + 1.0 * freq_loss + 3.0 * adv_loss + 3.0 * feat_loss)
                 val_metrics['val_total_loss'] += val_total.item()
                 
                 val_batches += 1
@@ -314,7 +322,7 @@ def main():
             "causal": False,
             "epochs": 300,
             "updates_per_epoch": 200,
-            "batch_size": 64,
+            "batch_size": 2,
             "learning_rate": 3e-4,
             "beta1": 0.5,
             "beta2": 0.9,
@@ -327,6 +335,10 @@ def main():
         }
     )
     
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
     # Build the model
     print("Building baseline autoencoder model...")
     model = build_encodec_model(
@@ -336,7 +348,7 @@ def main():
         n_residual_layers=1,
         dimension=32,
         causal=False
-    )
+    ).to(device)
     
     # Build MS-STFT discriminator
     print("Building MS-STFT discriminator...")
@@ -344,7 +356,7 @@ def main():
         in_channels=32,
         out_channels=1,
         filters=32
-    )
+    ).to(device)
     
     # Create optimizers with paper parameters
     print("Creating optimizers...")
@@ -371,40 +383,29 @@ def main():
         use_feature_matching=True
     )
     
-    # Create loss balancer with paper weights
-    print("Creating loss balancer with paper weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
-    loss_balancer = create_loss_balancer(
-        time_reconstruction_weight=0.1,    # λt = 0.1 (time domain)
-        freq_reconstruction_weight=1.0,    # λf = 1 (frequency domain)
-        adversarial_weight=3.0,            # λg = 3 (generator)
-        feature_matching_weight=3.0,       # λfeat = 3 (feature matching)
-        balance_grads=True,                # Enable gradient balancing
-        total_norm=1.0,                    # R = 1
-        ema_decay=0.999                    # β = 0.999
-    )
-    
-    print(f"Loss balancer weights: {loss_balancer.weights}")
-    print("Paper weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
+    # Loss weights from paper: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)
+    print("Using paper loss weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
     
     # Create dataloaders with paper-accurate parameters
     print("Creating dataloaders...")
     
     # So we need updates_per_epoch * batch_size samples per epoch
-    samples_per_epoch = 200 * 64 
+    samples_per_epoch = 200 * 4  # updates_per_epoch * batch_size
     val_dataset_size = samples_per_epoch // 4  # 1/4th of train dataset size
     
     # Create train/test dataloaders from single directory with 80/20 split
     train_loader, val_loader = create_train_test_dataloaders(
         audio_dir="/scratch/eigenscape/",
         train_ratio=0.8,          
-        batch_size=64,           
+        batch_size=4,           
         sample_rate=24000,
         segment_duration=1.0,    
         channels=32,
-        train_dataset_size=samples_per_epoch,  # 12,800 samples per epoch
-        test_dataset_size=val_dataset_size,    # 3,200 validation samples (1/4th)
+        train_dataset_size=samples_per_epoch,  # 800 samples per epoch
+        test_dataset_size=val_dataset_size,    # 200 validation samples (1/4th)
         min_file_duration=1.0,    
-        random_crop=True     
+        random_crop=True,
+        num_workers=0  # Disable multiprocessing to avoid crashes
     )
     
     # Log dataset information
@@ -429,10 +430,10 @@ def main():
         val_loader=val_loader,
         model_optimizer=model_optimizer,
         adversarial_loss=adversarial_loss,
-        loss_balancer=loss_balancer,
         num_epochs=num_epochs,
         updates_per_epoch=updates_per_epoch,
-        save_path=Path("best_model.pth")
+        save_path=Path("best_model.pth"),
+        device=device
     )
     
     print("Training completed!")

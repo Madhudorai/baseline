@@ -47,7 +47,6 @@ def test_imports():
         from discriminators import create_ms_stft_discriminator
         from adversarial_losses import create_adversarial_loss
         from losses import ReconstructionLoss
-        from loss_balancer import create_loss_balancer
         print("✅ All imports successful")
         return True
     except ImportError as e:
@@ -183,42 +182,27 @@ def test_model_and_losses():
         print(f"✅ Feature matching loss: {feat_loss_val.item():.6f}")
         
         # Test basic loss combination
-        print("\nTesting loss balancer (basic functionality)...")
-        from loss_balancer import create_loss_balancer
-        
-        # Test balancer creation and basic properties
-        balancer = create_loss_balancer(
-            time_reconstruction_weight=0.1,
-            freq_reconstruction_weight=1.0,
-            adversarial_weight=3.0,
-            feature_matching_weight=3.0,
-            balance_grads=True
-        )
-        
-        print(f"✅ Loss balancer created successfully")
-        print(f"   Weights: {balancer.weights}")
-        print(f"   Balance grads: {balancer.balance_grads}")
-        print(f"   Total norm: {balancer.total_norm}")
+        print("\nTesting weighted loss combination...")
         
         # Test simple weighted loss combination (what happens in training)
         model.train()
         fresh_reconstructed = model(real_audio)
-        fresh_recon_loss, _ = recon_loss(fresh_reconstructed, real_audio)
+        fresh_recon_loss, fresh_recon_metrics = recon_loss(fresh_reconstructed, real_audio)
         fresh_adv_loss, fresh_feat_loss = adv_loss(fresh_reconstructed, real_audio)
         
-        # Simple weighted combination (same as what balancer would do without gradient balancing)
-        # Note: In the test, we only have the total reconstruction loss, so we approximate
-        # the time and frequency components by splitting the total loss
-        total_loss = (balancer.weights['time_reconstruction'] * fresh_recon_loss * 0.1 + 
-                     balancer.weights['freq_reconstruction'] * fresh_recon_loss * 0.9 +
-                     balancer.weights['adversarial'] * fresh_adv_loss + 
-                     balancer.weights['feature_matching'] * fresh_feat_loss)
+        # Get time and frequency components
+        fresh_time_loss = fresh_recon_metrics['time_loss']
+        fresh_freq_loss = fresh_recon_metrics['freq_loss']
+        
+        # Simple weighted combination using paper weights
+        total_loss = (0.1 * fresh_time_loss + 1.0 * fresh_freq_loss + 3.0 * fresh_adv_loss + 3.0 * fresh_feat_loss)
         
         print(f"✅ Weighted loss combination: {total_loss.item():.6f}")
-        print(f"   Reconstruction: {fresh_recon_loss.item():.6f}")
+        print(f"   Time reconstruction: {fresh_time_loss.item():.6f}")
+        print(f"   Freq reconstruction: {fresh_freq_loss.item():.6f}")
         print(f"   Adversarial: {fresh_adv_loss.item():.6f}")
         print(f"   Feature matching: {fresh_feat_loss.item():.6f}")
-        print(f"   Note: Loss balancer will work correctly in actual training")
+        print(f"   Using paper weights: λt=0.1, λf=1.0, λg=3.0, λfeat=3.0")
         
         # Test backpropagation
         print("\nTesting backpropagation...")
