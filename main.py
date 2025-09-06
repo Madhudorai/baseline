@@ -13,6 +13,7 @@ from model_builder import build_encodec_model
 from dataloader import create_train_test_dataloaders
 from discriminators import create_ms_stft_discriminator
 from adversarial_losses import create_adversarial_loss
+from loss_balancer import create_loss_balancer
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +102,7 @@ def setup_wandb():
 
 
 def train_baseline_with_wandb(model, discriminator, train_loader, val_loader, 
-                            model_optimizer, adversarial_loss, reconstruction_weight,
-                            adversarial_weight, feature_matching_weight,
+                            model_optimizer, adversarial_loss, loss_balancer,
                             num_epochs, updates_per_epoch, save_path):
     """Custom training loop with comprehensive wandb logging for baseline autoencoder."""
     
@@ -159,20 +159,22 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     real=batch
                 )
                 
-                # Step 2: Train generator (baseline autoencoder) with simple weighted loss
+                # Step 2: Train generator (baseline autoencoder) with loss balancer
                 model_optimizer.zero_grad()
                 
                 # Compute individual losses
                 recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
                 adv_loss, feat_loss = adversarial_loss(reconstructed_audio, batch)
                 
-                # Simple weighted combination (paper weights)
-                effective_loss = (reconstruction_weight * recon_loss + 
-                                adversarial_weight * adv_loss + 
-                                feature_matching_weight * feat_loss)
+                # Use loss balancer for gradient balancing
+                losses = {
+                    'reconstruction': recon_loss,
+                    'adversarial': adv_loss,
+                    'feature_matching': feat_loss
+                }
                 
-                # Backward pass
-                effective_loss.backward()
+                # The balancer handles gradient computation and backward pass
+                effective_loss = loss_balancer.backward(losses, reconstructed_audio)
                 
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -201,12 +203,10 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         'update': update
                     })
                     
-                    # Log loss weights
-                    wandb.log({
-                        'train/reconstruction_weight': reconstruction_weight,
-                        'train/adversarial_weight': adversarial_weight,
-                        'train/feature_matching_weight': feature_matching_weight
-                    })
+                    # Log balancer metrics
+                    if loss_balancer.metrics:
+                        for name, ratio in loss_balancer.metrics.items():
+                            wandb.log({f'train/balancer_{name}': ratio})
                 
                 global_step += 1
                 
@@ -256,9 +256,11 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 val_metrics['val_reconstruction_loss'] += recon_loss.item()
                 val_metrics['val_adversarial_loss'] += adv_loss.item()
                 val_metrics['val_feature_matching_loss'] += feat_loss.item()
-                val_metrics['val_total_loss'] += (reconstruction_weight * recon_loss + 
-                                                adversarial_weight * adv_loss + 
-                                                feature_matching_weight * feat_loss).item()
+                # Use same weights as training for validation
+                val_total = (loss_balancer.weights['reconstruction'] * recon_loss + 
+                           loss_balancer.weights['adversarial'] * adv_loss + 
+                           loss_balancer.weights['feature_matching'] * feat_loss)
+                val_metrics['val_total_loss'] += val_total.item()
                 
                 val_batches += 1
         
@@ -375,11 +377,19 @@ def main():
         use_feature_matching=True
     )
     
-    # Loss weights (paper parameters)
-    logger.info("Using paper loss weights: λf=1, λg=3, λfeat=3 (24kHz model)")
-    reconstruction_weight = 1.0      # λf = 1 (frequency domain)
-    adversarial_weight = 3.0         # λg = 3 (generator)
-    feature_matching_weight = 3.0    # λfeat = 3 (feature matching)
+    # Create loss balancer with paper weights
+    logger.info("Creating loss balancer with paper weights: λf=1, λg=3, λfeat=3 (24kHz model)")
+    loss_balancer = create_loss_balancer(
+        reconstruction_weight=1.0,      # λf = 1 (frequency domain)
+        adversarial_weight=3.0,         # λg = 3 (generator)
+        feature_matching_weight=3.0,    # λfeat = 3 (feature matching)
+        balance_grads=True,             # Enable gradient balancing
+        total_norm=1.0,                 # R = 1
+        ema_decay=0.999                 # β = 0.999
+    )
+    
+    logger.info(f"Loss balancer weights: {loss_balancer.weights}")
+    logger.info("Paper weights: λf=1, λg=3, λfeat=3 (24kHz model)")
     
     # Create dataloaders with paper-accurate parameters
     logger.info("Creating dataloaders...")
@@ -424,9 +434,7 @@ def main():
         val_loader=val_loader,
         model_optimizer=model_optimizer,
         adversarial_loss=adversarial_loss,
-        reconstruction_weight=reconstruction_weight,
-        adversarial_weight=adversarial_weight,
-        feature_matching_weight=feature_matching_weight,
+        loss_balancer=loss_balancer,
         num_epochs=num_epochs,
         updates_per_epoch=updates_per_epoch,
         save_path=Path("best_model.pth")
