@@ -41,7 +41,6 @@ def setup_wandb():
         api = wandb.Api()
         print("✅ You are logged in to wandb")
         print(f"   Username: {api.default_entity}")
-        return
     except Exception:
         print("❌ You are not logged in to wandb")
         print("\nTo login:")
@@ -63,35 +62,7 @@ def setup_wandb():
         except Exception as e:
             print(f"⚠️  Could not login automatically: {e}")
             print("   Please run 'wandb login' manually")
-    
-    print("\n" + "=" * 60)
-    print("WANDB CONFIGURATION")
-    print("=" * 60)
-    
-    # Show what will be logged
-    print("During training, the following metrics will be logged:")
-    print("\n📊 Training Metrics (every 100 steps):")
-    print("   - train/reconstruction_loss")
-    print("   - train/adversarial_loss") 
-    print("   - train/feature_matching_loss")
-    print("   - train/effective_loss")
-    print("   - train/discriminator_loss")
-    print("   - train/learning_rate")
-    
-    print("\n📊 Epoch Metrics:")
-    print("   - train/epoch_* (averaged over epoch)")
-    print("   - val_* (validation metrics)")
-    print("   - epoch progress")
-    
-    print("\n⚙️  Model Configuration:")
-    print("   - All hyperparameters")
-    print("   - Model architecture")
-    print("   - Training settings")
-    
-    print("\n💾 Artifacts:")
-    print("   - Best model checkpoints")
-    print("   - Training logs")
-    
+ 
     print("\n" + "=" * 60)
     print("NEXT STEPS")
     print("=" * 60)
@@ -117,7 +88,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
     best_val_loss = float('inf')
     
     for epoch in range(num_epochs):
-        logger.info(f"Starting epoch {epoch + 1}/{num_epochs}")
+        print(f"Starting epoch {epoch + 1}/{num_epochs}")
         
         # Training phase
         model.train()
@@ -314,14 +285,14 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 'val_loss': best_val_loss,
                 'config': wandb.config
             }, save_path)
-            logger.info(f"Saved best model with validation loss: {best_val_loss:.6f}")
+            print(f"Saved best model with validation loss: {best_val_loss:.6f}")
         
         # Log epoch summary
-        logger.info(f"Epoch {epoch + 1}/{num_epochs} completed:")
-        logger.info(f"  Train - Recon: {train_metrics['reconstruction_loss']:.6f}, "
+        print(f"Epoch {epoch + 1}/{num_epochs} completed:")
+        print(f"  Train - Recon: {train_metrics['reconstruction_loss']:.6f}, "
                    f"Adv: {train_metrics['adversarial_loss']:.6f}, "
                    f"Feat: {train_metrics['feature_matching_loss']:.6f}")
-        logger.info(f"  Val - Total: {val_metrics['val_total_loss']:.6f}")
+        print(f"  Val - Total: {val_metrics['val_total_loss']:.6f}")
 
 
 def main():
@@ -357,7 +328,7 @@ def main():
     )
     
     # Build the model
-    logger.info("Building baseline autoencoder model...")
+    print("Building baseline autoencoder model...")
     model = build_encodec_model(
         sample_rate=24000,
         channels=32,
@@ -368,7 +339,7 @@ def main():
     )
     
     # Build MS-STFT discriminator
-    logger.info("Building MS-STFT discriminator...")
+    print("Building MS-STFT discriminator...")
     discriminator = create_ms_stft_discriminator(
         in_channels=32,
         out_channels=1,
@@ -376,7 +347,7 @@ def main():
     )
     
     # Create optimizers with paper parameters
-    logger.info("Creating optimizers...")
+    print("Creating optimizers...")
     model_optimizer = torch.optim.Adam(
         model.parameters(),
         lr=3e-4,      # Paper: 3 · 10^-4
@@ -392,7 +363,7 @@ def main():
     )
     
     # Create adversarial loss
-    logger.info("Creating adversarial loss...")
+    print("Creating adversarial loss...")
     adversarial_loss = create_adversarial_loss(
         discriminator=discriminator,
         optimizer=disc_optimizer,
@@ -401,7 +372,7 @@ def main():
     )
     
     # Create loss balancer with paper weights
-    logger.info("Creating loss balancer with paper weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
+    print("Creating loss balancer with paper weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
     loss_balancer = create_loss_balancer(
         time_reconstruction_weight=0.1,    # λt = 0.1 (time domain)
         freq_reconstruction_weight=1.0,    # λf = 1 (frequency domain)
@@ -412,11 +383,11 @@ def main():
         ema_decay=0.999                    # β = 0.999
     )
     
-    logger.info(f"Loss balancer weights: {loss_balancer.weights}")
-    logger.info("Paper weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
+    print(f"Loss balancer weights: {loss_balancer.weights}")
+    print("Paper weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
     
     # Create dataloaders with paper-accurate parameters
-    logger.info("Creating dataloaders...")
+    print("Creating dataloaders...")
     
     # So we need updates_per_epoch * batch_size samples per epoch
     samples_per_epoch = 200 * 64 
@@ -425,30 +396,30 @@ def main():
     # Create train/test dataloaders from single directory with 80/20 split
     train_loader, val_loader = create_train_test_dataloaders(
         audio_dir="/scratch/eigenscape/",
-        train_ratio=0.8,          # 80% train, 20% test
-        batch_size=64,            # Paper: batch size 64
+        train_ratio=0.8,          
+        batch_size=64,           
         sample_rate=24000,
-        segment_duration=1.0,     # Paper: 1 second segments
+        segment_duration=1.0,    
         channels=32,
         train_dataset_size=samples_per_epoch,  # 12,800 samples per epoch
         test_dataset_size=val_dataset_size,    # 3,200 validation samples (1/4th)
-        min_file_duration=1.0,    # Only files longer than 1s
-        random_crop=True          # Random segments for variety
+        min_file_duration=1.0,    
+        random_crop=True     
     )
     
     # Log dataset information
-    logger.info(f"Training dataset size: {len(train_loader.dataset)} samples")
-    logger.info(f"Validation dataset size: {len(val_loader.dataset)} samples")
-    logger.info(f"Training batches per epoch: {len(train_loader)}")
-    logger.info(f"Validation batches per epoch: {len(val_loader)}")
+    print(f"Training dataset size: {len(train_loader.dataset)} samples")
+    print(f"Validation dataset size: {len(val_loader.dataset)} samples")
+    print(f"Training batches per epoch: {len(train_loader)}")
+    print(f"Validation batches per epoch: {len(val_loader)}")
     
     # Paper: 300 epochs, 2000 updates per epoch
     num_epochs = 300
     updates_per_epoch = 200
     
-    logger.info(f"Starting training for {num_epochs} epochs...")
-    logger.info(f"Each epoch has {updates_per_epoch} updates")
-    logger.info(f"Total updates: {num_epochs * updates_per_epoch}")
+    print(f"Starting training for {num_epochs} epochs...")
+    print(f"Each epoch has {updates_per_epoch} updates")
+    print(f"Total updates: {num_epochs * updates_per_epoch}")
     
     # Custom training loop with wandb logging
     train_baseline_with_wandb(
@@ -464,7 +435,7 @@ def main():
         save_path=Path("best_model.pth")
     )
     
-    logger.info("Training completed!")
+    print("Training completed!")
     wandb.finish()
 
 

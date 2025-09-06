@@ -68,11 +68,6 @@ class MultiChannelAudioDataset(Dataset):
             if len(self.audio_files) == 0:
                 raise ValueError(f"No audio files longer than {min_file_duration}s found")
         
-        print(f"Found {len(self.audio_files)} audio files")
-        if dataset_size is not None:
-            print(f"Virtual dataset size: {dataset_size} samples")
-            print(f"Each file will contribute ~{dataset_size // len(self.audio_files)} samples on average")
-    
     def _find_audio_files(self) -> tp.List[Path]:
         """Find all audio files in the directory."""
         audio_files = []
