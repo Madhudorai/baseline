@@ -342,7 +342,7 @@ def main():
             "dimension": 32,
             "causal": False,
             "epochs": 300,
-            "updates_per_epoch": 2000,
+            "updates_per_epoch": 200,
             "batch_size": 64,
             "learning_rate": 3e-4,
             "beta1": 0.5,
@@ -418,9 +418,9 @@ def main():
     # Create dataloaders with paper-accurate parameters
     logger.info("Creating dataloaders...")
     
-    # Paper: 2000 updates per epoch with batch size 64
-    # So we need 2000 * 64 = 128,000 samples per epoch
-    samples_per_epoch = 2000 * 64  # 128,000 samples
+    # So we need updates_per_epoch * batch_size samples per epoch
+    samples_per_epoch = 200 * 64 
+    val_dataset_size = samples_per_epoch // 4  # 1/4th of train dataset size
     
     # Create train/test dataloaders from single directory with 80/20 split
     train_loader, val_loader = create_train_test_dataloaders(
@@ -430,8 +430,8 @@ def main():
         sample_rate=24000,
         segment_duration=1.0,     # Paper: 1 second segments
         channels=32,
-        train_dataset_size=samples_per_epoch,  # 128,000 samples per epoch
-        test_dataset_size=10000,  # 10,000 validation samples
+        train_dataset_size=samples_per_epoch,  # 12,800 samples per epoch
+        test_dataset_size=val_dataset_size,    # 3,200 validation samples (1/4th)
         min_file_duration=1.0,    # Only files longer than 1s
         random_crop=True          # Random segments for variety
     )
@@ -444,7 +444,7 @@ def main():
     
     # Paper: 300 epochs, 2000 updates per epoch
     num_epochs = 300
-    updates_per_epoch = 2000
+    updates_per_epoch = 200
     
     logger.info(f"Starting training for {num_epochs} epochs...")
     logger.info(f"Each epoch has {updates_per_epoch} updates")
