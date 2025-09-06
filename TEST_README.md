@@ -29,7 +29,7 @@ python3 test_setup.py
 
 **What it tests:**
 - ✅ All imports work correctly
-- ✅ Dataloader with real audio files from `/Users/swarsys/Documents/GitHub/eigenscape/`
+- ✅ Dataloader with real audio files from "/scratch/eigenscape/"
 - ✅ Model creation and forward pass
 - ✅ All loss functions
 - ✅ Discriminator training
@@ -53,7 +53,7 @@ Both scripts will show:
 - Look at the specific error messages for guidance
 
 ### If `test_setup.py` fails:
-- Make sure the audio directory exists: `/Users/swarsys/Documents/GitHub/eigenscape/`
+- Make sure the audio directory exists
 - Ensure there are audio files (`.wav` format) in the directory
 - Check that files are longer than 1 second
 - Use `test_core.py` first to verify core functionality

@@ -141,7 +141,8 @@ class LossBalancer:
         return self._metrics
 
 
-def create_loss_balancer(reconstruction_weight: float = 1.0,
+def create_loss_balancer(time_reconstruction_weight: float = 0.1,
+                        freq_reconstruction_weight: float = 1.0,
                         adversarial_weight: float = 3.0,
                         feature_matching_weight: float = 3.0,
                         balance_grads: bool = True,
@@ -151,15 +152,17 @@ def create_loss_balancer(reconstruction_weight: float = 1.0,
     Create a loss balancer with paper parameters.
     
     Args:
-        reconstruction_weight: Weight for reconstruction loss
-        adversarial_weight: Weight for adversarial loss  
-        feature_matching_weight: Weight for feature matching loss
+        time_reconstruction_weight: Weight for time domain reconstruction loss (λt)
+        freq_reconstruction_weight: Weight for frequency domain reconstruction loss (λf)
+        adversarial_weight: Weight for adversarial loss (λg)
+        feature_matching_weight: Weight for feature matching loss (λfeat)
         balance_grads: Whether to balance gradients
         total_norm: Target total gradient norm
         ema_decay: EMA decay rate
     """
     weights = {
-        'reconstruction': reconstruction_weight,
+        'time_reconstruction': time_reconstruction_weight,
+        'freq_reconstruction': freq_reconstruction_weight,
         'adversarial': adversarial_weight,
         'feature_matching': feature_matching_weight
     }

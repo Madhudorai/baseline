@@ -41,7 +41,7 @@ def test_dataloader():
         from dataloader import create_train_test_dataloaders
         
         # Test directory (you can change this to your actual directory)
-        test_dir = "/Users/swarsys/Documents/GitHub/eigenscape/"
+        test_dir = "/scratch/eigenscape/"
         
         print(f"Testing dataloader with directory: {test_dir}")
         print("Note: This will fail if the directory doesn't exist or has no audio files")

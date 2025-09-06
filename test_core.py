@@ -188,7 +188,8 @@ def test_model_and_losses():
         
         # Test balancer creation and basic properties
         balancer = create_loss_balancer(
-            reconstruction_weight=1.0,
+            time_reconstruction_weight=0.1,
+            freq_reconstruction_weight=1.0,
             adversarial_weight=3.0,
             feature_matching_weight=3.0,
             balance_grads=True
@@ -206,7 +207,10 @@ def test_model_and_losses():
         fresh_adv_loss, fresh_feat_loss = adv_loss(fresh_reconstructed, real_audio)
         
         # Simple weighted combination (same as what balancer would do without gradient balancing)
-        total_loss = (balancer.weights['reconstruction'] * fresh_recon_loss + 
+        # Note: In the test, we only have the total reconstruction loss, so we approximate
+        # the time and frequency components by splitting the total loss
+        total_loss = (balancer.weights['time_reconstruction'] * fresh_recon_loss * 0.1 + 
+                     balancer.weights['freq_reconstruction'] * fresh_recon_loss * 0.9 +
                      balancer.weights['adversarial'] * fresh_adv_loss + 
                      balancer.weights['feature_matching'] * fresh_feat_loss)
         

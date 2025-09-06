@@ -124,6 +124,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         discriminator.train()
         
         train_metrics = {
+            'time_reconstruction_loss': 0.0,
+            'freq_reconstruction_loss': 0.0,
             'reconstruction_loss': 0.0,
             'adversarial_loss': 0.0,
             'feature_matching_loss': 0.0,
@@ -166,9 +168,14 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
                 adv_loss, feat_loss = adversarial_loss(reconstructed_audio, batch)
                 
+                # Split reconstruction loss into time and frequency components
+                time_loss = recon_metrics['time_loss']
+                freq_loss = recon_metrics['freq_loss']
+                
                 # Use loss balancer for gradient balancing
                 losses = {
-                    'reconstruction': recon_loss,
+                    'time_reconstruction': time_loss,
+                    'freq_reconstruction': freq_loss,
                     'adversarial': adv_loss,
                     'feature_matching': feat_loss
                 }
@@ -183,7 +190,9 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 model_optimizer.step()
                 
                 # Update metrics
-                train_metrics['reconstruction_loss'] += recon_loss.item()
+                train_metrics['time_reconstruction_loss'] += time_loss.item()
+                train_metrics['freq_reconstruction_loss'] += freq_loss.item()
+                train_metrics['reconstruction_loss'] += recon_loss.item()  # Keep total for compatibility
                 train_metrics['adversarial_loss'] += adv_loss.item()
                 train_metrics['feature_matching_loss'] += feat_loss.item()
                 train_metrics['total_loss'] += effective_loss.item()
@@ -192,6 +201,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 # Log to wandb every 100 steps
                 if global_step % 100 == 0:
                     wandb.log({
+                        'train/time_reconstruction_loss': time_loss.item(),
+                        'train/freq_reconstruction_loss': freq_loss.item(),
                         'train/reconstruction_loss': recon_loss.item(),
                         'train/adversarial_loss': adv_loss.item(),
                         'train/feature_matching_loss': feat_loss.item(),
@@ -224,6 +235,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         discriminator.eval()
         
         val_metrics = {
+            'val_time_reconstruction_loss': 0.0,
+            'val_freq_reconstruction_loss': 0.0,
             'val_reconstruction_loss': 0.0,
             'val_adversarial_loss': 0.0,
             'val_feature_matching_loss': 0.0,
@@ -250,14 +263,22 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     )
                 
                 # Compute losses
-                recon_loss, _ = reconstruction_loss(reconstructed_audio, batch)
+                recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
                 adv_loss, feat_loss = adversarial_loss(reconstructed_audio, batch)
                 
+                # Split reconstruction loss into time and frequency components
+                time_loss = recon_metrics['time_loss']
+                freq_loss = recon_metrics['freq_loss']
+                
+                val_metrics['val_time_reconstruction_loss'] += time_loss.item()
+                val_metrics['val_freq_reconstruction_loss'] += freq_loss.item()
                 val_metrics['val_reconstruction_loss'] += recon_loss.item()
                 val_metrics['val_adversarial_loss'] += adv_loss.item()
                 val_metrics['val_feature_matching_loss'] += feat_loss.item()
+                
                 # Use same weights as training for validation
-                val_total = (loss_balancer.weights['reconstruction'] * recon_loss + 
+                val_total = (loss_balancer.weights['time_reconstruction'] * time_loss + 
+                           loss_balancer.weights['freq_reconstruction'] * freq_loss +
                            loss_balancer.weights['adversarial'] * adv_loss + 
                            loss_balancer.weights['feature_matching'] * feat_loss)
                 val_metrics['val_total_loss'] += val_total.item()
@@ -272,6 +293,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         # Log epoch metrics to wandb
         wandb.log({
             'epoch': epoch,
+            'train/epoch_time_reconstruction_loss': train_metrics['time_reconstruction_loss'],
+            'train/epoch_freq_reconstruction_loss': train_metrics['freq_reconstruction_loss'],
             'train/epoch_reconstruction_loss': train_metrics['reconstruction_loss'],
             'train/epoch_adversarial_loss': train_metrics['adversarial_loss'],
             'train/epoch_feature_matching_loss': train_metrics['feature_matching_loss'],
@@ -378,18 +401,19 @@ def main():
     )
     
     # Create loss balancer with paper weights
-    logger.info("Creating loss balancer with paper weights: λf=1, λg=3, λfeat=3 (24kHz model)")
+    logger.info("Creating loss balancer with paper weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
     loss_balancer = create_loss_balancer(
-        reconstruction_weight=1.0,      # λf = 1 (frequency domain)
-        adversarial_weight=3.0,         # λg = 3 (generator)
-        feature_matching_weight=3.0,    # λfeat = 3 (feature matching)
-        balance_grads=True,             # Enable gradient balancing
-        total_norm=1.0,                 # R = 1
-        ema_decay=0.999                 # β = 0.999
+        time_reconstruction_weight=0.1,    # λt = 0.1 (time domain)
+        freq_reconstruction_weight=1.0,    # λf = 1 (frequency domain)
+        adversarial_weight=3.0,            # λg = 3 (generator)
+        feature_matching_weight=3.0,       # λfeat = 3 (feature matching)
+        balance_grads=True,                # Enable gradient balancing
+        total_norm=1.0,                    # R = 1
+        ema_decay=0.999                    # β = 0.999
     )
     
     logger.info(f"Loss balancer weights: {loss_balancer.weights}")
-    logger.info("Paper weights: λf=1, λg=3, λfeat=3 (24kHz model)")
+    logger.info("Paper weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
     
     # Create dataloaders with paper-accurate parameters
     logger.info("Creating dataloaders...")
@@ -400,7 +424,7 @@ def main():
     
     # Create train/test dataloaders from single directory with 80/20 split
     train_loader, val_loader = create_train_test_dataloaders(
-        audio_dir="/Users/swarsys/Documents/GitHub/eigenscape/",
+        audio_dir="/scratch/eigenscape/",
         train_ratio=0.8,          # 80% train, 20% test
         batch_size=64,            # Paper: batch size 64
         sample_rate=24000,
