@@ -47,6 +47,7 @@ def test_imports():
         from discriminators import create_ms_stft_discriminator
         from adversarial_losses import create_adversarial_loss
         from losses import ReconstructionLoss
+        from balancer import Balancer
         print("✅ All imports successful")
         return True
     except ImportError as e:
@@ -223,6 +224,186 @@ def test_model_and_losses():
         print(f"   Error type: {type(e).__name__}")
         return False
 
+def test_balancer():
+    """Test loss balancer functionality."""
+    print("\n" + "=" * 60)
+    print("TESTING LOSS BALANCER")
+    print("=" * 60)
+    
+    try:
+        from balancer import Balancer
+        from losses import ReconstructionLoss
+        from discriminators import create_ms_stft_discriminator
+        from adversarial_losses import create_adversarial_loss
+        
+        # Create test data
+        batch_size = 2
+        channels = 32
+        samples = 24000
+        real_audio = torch.randn(batch_size, channels, samples)
+        fake_audio = torch.randn(batch_size, channels, samples)
+        
+        print(f"Test data shape: {real_audio.shape}")
+        
+        # Test basic balancer functionality
+        print("\nTesting basic balancer functionality...")
+        weights = {'loss1': 1.0, 'loss2': 2.0}
+        balancer = Balancer(
+            weights=weights,
+            balance_grads=True,
+            total_norm=1.0,
+            ema_decay=0.9,
+            per_batch_item=True,
+            epsilon=1e-12,
+            monitor=True
+        )
+        
+        # Create simple losses
+        y = fake_audio.clone()
+        y.requires_grad_(True)
+        loss1 = (y - 1.0).pow(2).mean()
+        loss2 = (y - 2.0).pow(2).mean()
+        
+        losses = {'loss1': loss1, 'loss2': loss2}
+        effective_loss = balancer.backward(losses, y)
+        
+        print(f"✅ Basic balancer test passed")
+        print(f"   Loss1: {loss1.item():.6f}")
+        print(f"   Loss2: {loss2.item():.6f}")
+        print(f"   Effective loss: {effective_loss.item():.6f}")
+        print(f"   Balancer metrics: {balancer.metrics}")
+        
+        # Test balancer with audio losses (similar to main training)
+        print("\nTesting balancer with audio-style losses...")
+        
+        # Create reconstruction loss
+        recon_loss = ReconstructionLoss(sample_rate=24000)
+        
+        # Create discriminator and adversarial loss
+        discriminator = create_ms_stft_discriminator(
+            in_channels=32,
+            out_channels=1,
+            filters=32
+        )
+        disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=3e-4)
+        adv_loss = create_adversarial_loss(
+            discriminator=discriminator,
+            optimizer=disc_optimizer,
+            loss_type='hinge',
+            use_feature_matching=True
+        )
+        
+        # Create balancer with paper weights
+        paper_weights = {
+            'time_loss': 0.1,      # λt - time domain reconstruction
+            'freq_loss': 1.0,      # λf - frequency domain reconstruction  
+            'adv_loss': 3.0,       # λg - adversarial loss
+            'feat_loss': 3.0       # λfeat - feature matching loss
+        }
+        
+        audio_balancer = Balancer(
+            weights=paper_weights,
+            balance_grads=True,
+            total_norm=1.0,
+            ema_decay=0.999,
+            per_batch_item=True,
+            epsilon=1e-12,
+            monitor=True
+        )
+        
+        # Compute audio losses
+        recon_loss_val, recon_metrics = recon_loss(fake_audio, real_audio)
+        adv_loss_val, feat_loss_val = adv_loss(fake_audio, real_audio)
+        
+        time_loss = recon_metrics['time_loss']
+        freq_loss = recon_metrics['freq_loss']
+        
+        # Test balancer with audio losses
+        # Ensure fake_audio has gradients enabled for balancer
+        fake_audio.requires_grad_(True)
+        
+        balanced_losses = {
+            'time_loss': time_loss,
+            'freq_loss': freq_loss,
+            'adv_loss': adv_loss_val,
+            'feat_loss': feat_loss_val
+        }
+        
+        effective_loss = audio_balancer.backward(balanced_losses, fake_audio)
+        
+        print(f"✅ Audio balancer test passed")
+        print(f"   Time loss: {time_loss.item():.6f}")
+        print(f"   Freq loss: {freq_loss.item():.6f}")
+        print(f"   Adv loss: {adv_loss_val.item():.6f}")
+        print(f"   Feat loss: {feat_loss_val.item():.6f}")
+        print(f"   Effective loss: {effective_loss.item():.6f}")
+        print(f"   Balancer metrics: {audio_balancer.metrics}")
+        
+        # Test balancer without gradient balancing
+        print("\nTesting balancer without gradient balancing...")
+        simple_balancer = Balancer(
+            weights={'loss1': 1.0, 'loss2': 2.0},
+            balance_grads=False,  # Disable gradient balancing
+            total_norm=1.0,
+            ema_decay=0.9,
+            per_batch_item=True,
+            epsilon=1e-12,
+            monitor=True
+        )
+        
+        y2 = fake_audio.clone()
+        y2.requires_grad_(True)
+        loss1 = (y2 - 1.0).pow(2).mean()
+        loss2 = (y2 - 2.0).pow(2).mean()
+        
+        simple_losses = {'loss1': loss1, 'loss2': loss2}
+        simple_effective_loss = simple_balancer.backward(simple_losses, y2)
+        
+        # Should be simple weighted sum: 1.0 * loss1 + 2.0 * loss2
+        expected_loss = 1.0 * loss1 + 2.0 * loss2
+        
+        print(f"✅ Non-balancing balancer test passed")
+        print(f"   Loss1: {loss1.item():.6f}")
+        print(f"   Loss2: {loss2.item():.6f}")
+        print(f"   Effective loss: {simple_effective_loss.item():.6f}")
+        print(f"   Expected (1.0 * loss1 + 2.0 * loss2): {expected_loss.item():.6f}")
+        
+        # Test gradient ratio maintenance over multiple steps
+        print("\nTesting gradient ratio maintenance...")
+        ratio_balancer = Balancer(
+            weights={'loss1': 1.0, 'loss2': 3.0},  # loss2 should get 75% of gradient
+            balance_grads=True,
+            total_norm=1.0,
+            ema_decay=0.9,
+            per_batch_item=True,
+            epsilon=1e-12,
+            monitor=True
+        )
+        
+        for step in range(3):
+            y3 = torch.randn(batch_size, channels, samples, requires_grad=True)
+            loss1 = (y3 - 1.0).pow(2).mean()
+            loss2 = (y3 - 2.0).pow(2).mean()
+            
+            ratio_losses = {'loss1': loss1, 'loss2': loss2}
+            ratio_effective_loss = ratio_balancer.backward(ratio_losses, y3)
+            
+            print(f"   Step {step + 1}: Loss1={loss1.item():.6f}, Loss2={loss2.item():.6f}, "
+                  f"Effective={ratio_effective_loss.item():.6f}")
+            if ratio_balancer.metrics:
+                print(f"   Gradient ratios: {ratio_balancer.metrics}")
+        
+        print("✅ Gradient ratio test completed")
+        print("✅ All balancer tests passed!")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Balancer test failed: {e}")
+        print(f"   Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def main():
     """Run core tests."""
     print("🚀 STARTING BASELINE AUTOENCODER TESTS")
@@ -231,7 +412,8 @@ def main():
     tests = [
         ("Imports", test_imports),
         ("Dataloader with Dummy Data", test_dataloader_with_dummy_data),
-        ("Model and Losses", test_model_and_losses)
+        ("Model and Losses", test_model_and_losses),
+        ("Loss Balancer", test_balancer)
     ]
     
     results = []

@@ -115,17 +115,18 @@ class AdversarialLoss(nn.Module):
         adv = torch.tensor(0., device=fake.device)
         feat = torch.tensor(0., device=fake.device)
         
-        # Set adversary to eval mode for inference
+        # Use eval mode for inference but don't block gradients
         self.adversary.eval()
-        with torch.no_grad():
-            all_logits_fake_is_fake, all_fmap_fake = self.get_adversary_pred(fake)
-            all_logits_real_is_fake, all_fmap_real = self.get_adversary_pred(real)
-            n_sub_adversaries = len(all_logits_fake_is_fake)
-            for logit_fake_is_fake in all_logits_fake_is_fake:
-                adv += self.loss(logit_fake_is_fake)
-            if self.loss_feat:
-                for fmap_fake, fmap_real in zip(all_fmap_fake, all_fmap_real):
-                    feat += self.loss_feat(fmap_fake, fmap_real)
+        
+        # Don't use no_grad() - we need gradients to flow for the balancer
+        all_logits_fake_is_fake, all_fmap_fake = self.get_adversary_pred(fake)
+        all_logits_real_is_fake, all_fmap_real = self.get_adversary_pred(real)
+        n_sub_adversaries = len(all_logits_fake_is_fake)
+        for logit_fake_is_fake in all_logits_fake_is_fake:
+            adv += self.loss(logit_fake_is_fake)
+        if self.loss_feat:
+            for fmap_fake, fmap_real in zip(all_fmap_fake, all_fmap_real):
+                feat += self.loss_feat(fmap_fake, fmap_real)
 
         if self.normalize:
             adv /= n_sub_adversaries

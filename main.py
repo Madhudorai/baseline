@@ -13,6 +13,7 @@ from model_builder import build_encodec_model
 from dataloader import create_train_test_dataloaders, create_folder_based_dataloaders
 from discriminators import create_ms_stft_discriminator
 from adversarial_losses import create_adversarial_loss
+from balancer import Balancer
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,24 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
     
     # Create reconstruction loss
     reconstruction_loss = ReconstructionLoss(sample_rate=24000)
+    
+    # Create loss balancer with paper weights: λt=0.1, λf=1, λg=3, λfeat=3
+    loss_weights = {
+        'time_loss': 0.1,      # λt - time domain reconstruction
+        'freq_loss': 1.0,      # λf - frequency domain reconstruction  
+        'adv_loss': 3.0,       # λg - adversarial loss
+        'feat_loss': 3.0       # λfeat - feature matching loss
+    }
+    
+    balancer = Balancer(
+        weights=loss_weights,
+        balance_grads=True,     # Enable gradient balancing
+        total_norm=1.0,         # Reference norm for scaling
+        ema_decay=0.999,        # EMA decay for gradient norm tracking
+        per_batch_item=True,    # Compute norms per batch item
+        epsilon=1e-12,          # Numerical stability
+        monitor=True            # Store gradient ratio metrics
+    )
     
     # Training state
     global_step = 0
@@ -156,16 +175,22 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     print(f"  batch stats: min={batch.min().item():.6f}, max={batch.max().item():.6f}, mean={batch.mean().item():.6f}")
                     print(f"  reconstructed stats: min={reconstructed_audio.min().item():.6f}, max={reconstructed_audio.max().item():.6f}, mean={reconstructed_audio.mean().item():.6f}")
                 
-                # Simple weighted loss combination (temporarily disable balancer)
-                effective_loss = (0.1 * time_loss + 1.0 * freq_loss + 3.0 * adv_loss + 3.0 * feat_loss)
+                # Use loss balancer for gradient balancing
+                balanced_losses = {
+                    'time_loss': time_loss,
+                    'freq_loss': freq_loss,
+                    'adv_loss': adv_loss,
+                    'feat_loss': feat_loss
+                }
                 
-                # Manual backward pass
-                effective_loss.backward()
+                # Apply balancer - this handles gradient balancing and backward pass
+                effective_loss = balancer.backward(balanced_losses, reconstructed_audio)
                 
-                # DEBUG: Print effective loss
+                # DEBUG: Print effective loss and balancer metrics
                 if update == 0:
                     print(f"DEBUG - Effective loss: {effective_loss.item():.6f}")
                     print(f"DEBUG - Loss weights: λt=0.1, λf=1.0, λg=3.0, λfeat=3.0")
+                    print(f"DEBUG - Balancer metrics: {balancer.metrics}")
                 
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -184,7 +209,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 
                 # Log to wandb every 100 steps
                 if global_step % 100 == 0:
-                    wandb.log({
+                    log_dict = {
                         'train/time_reconstruction_loss': time_loss.item(),
                         'train/freq_reconstruction_loss': freq_loss.item(),
                         'train/reconstruction_loss': recon_loss.item(),
@@ -196,7 +221,14 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         'epoch': epoch,
                         'global_step': global_step,
                         'update': update
-                    })
+                    }
+                    
+                    # Add balancer metrics if available
+                    if balancer.metrics:
+                        for key, value in balancer.metrics.items():
+                            log_dict[f'train/balancer_{key}'] = value
+                    
+                    wandb.log(log_dict)
                                    
                 global_step += 1
                 
@@ -258,8 +290,20 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 val_metrics['val_adversarial_loss'] += adv_loss.item()
                 val_metrics['val_feature_matching_loss'] += feat_loss.item()
                 
-                # Use paper weights for validation
-                val_total = (0.1 * time_loss + 1.0 * freq_loss + 3.0 * adv_loss + 3.0 * feat_loss)
+                # Use balancer for validation (in eval mode, no gradients)
+                balanced_losses = {
+                    'time_loss': time_loss,
+                    'freq_loss': freq_loss,
+                    'adv_loss': adv_loss,
+                    'feat_loss': feat_loss
+                }
+                
+                # For validation, we just compute the effective loss without backward pass
+                # We need to temporarily enable gradients for the balancer to work
+                reconstructed_audio.requires_grad_(True)
+                val_total = balancer.backward(balanced_losses, reconstructed_audio)
+                reconstructed_audio.requires_grad_(False)
+                
                 val_metrics['val_total_loss'] += val_total.item()
                 
                 val_batches += 1
@@ -328,9 +372,18 @@ def main():
             "beta2": 0.9,
             "segment_duration": 1.0,
             "loss_weights": {
-                "reconstruction": 1.0,      # λf (frequency domain)
-                "adversarial": 3.0,         # λg (generator)
-                "feature_matching": 3.0     # λfeat (feature matching)
+                "time_reconstruction": 0.1,  # λt (time domain)
+                "freq_reconstruction": 1.0,  # λf (frequency domain)
+                "adversarial": 3.0,          # λg (generator)
+                "feature_matching": 3.0      # λfeat (feature matching)
+            },
+            "balancer": {
+                "balance_grads": True,       # Enable gradient balancing
+                "total_norm": 1.0,          # Reference norm for scaling
+                "ema_decay": 0.999,         # EMA decay for gradient norm tracking
+                "per_batch_item": True,     # Compute norms per batch item
+                "epsilon": 1e-12,           # Numerical stability
+                "monitor": True             # Store gradient ratio metrics
             }
         }
     )
