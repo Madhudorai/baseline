@@ -10,7 +10,7 @@ import torch
 from pathlib import Path
 
 from model_builder import build_encodec_model
-from dataloader import create_train_test_dataloaders
+from dataloader import create_train_test_dataloaders, create_folder_based_dataloaders
 from discriminators import create_ms_stft_discriminator
 from adversarial_losses import create_adversarial_loss
 
@@ -386,23 +386,24 @@ def main():
     # Loss weights from paper: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)
     print("Using paper loss weights: λt=0.1, λf=1, λg=3, λfeat=3 (24kHz model)")
     
-    # Create dataloaders with paper-accurate parameters
+    # Create dataloaders with folder-based split
     print("Creating dataloaders...")
     
-    # So we need updates_per_epoch * batch_size samples per epoch
-    samples_per_epoch = 200 * 4  # updates_per_epoch * batch_size
-    val_dataset_size = samples_per_epoch // 4  # 1/4th of train dataset size
+    # Define folder-based train/validation split
+    train_folders = ["Beach", "Busy Street", "Park", "Pedestrian Zone", "Quiet Street", "Shopping Centre"]
+    val_folders = ["Woodland", "Train Station"]
     
-    # Create train/test dataloaders from single directory with 80/20 split
-    train_loader, val_loader = create_train_test_dataloaders(
+    # Create folder-based dataloaders with 10k train samples and 2.5k validation samples
+    train_loader, val_loader = create_folder_based_dataloaders(
         audio_dir="/scratch/eigenscape/",
-        train_ratio=0.8,          
+        train_folders=train_folders,
+        val_folders=val_folders,
         batch_size=4,           
         sample_rate=24000,
         segment_duration=1.0,    
         channels=32,
-        train_dataset_size=samples_per_epoch,  # 800 samples per epoch
-        test_dataset_size=val_dataset_size,    # 200 validation samples (1/4th)
+        train_dataset_size=10000,  # 10k training samples per epoch
+        val_dataset_size=2500,     # 2.5k validation samples (fixed each epoch)
         min_file_duration=1.0,    
         random_crop=True,
         num_workers=0  # Disable multiprocessing to avoid crashes
@@ -414,13 +415,16 @@ def main():
     print(f"Training batches per epoch: {len(train_loader)}")
     print(f"Validation batches per epoch: {len(val_loader)}")
     
-    # Paper: 300 epochs, 2000 updates per epoch
+    # Paper: 300 epochs, but now with 10k samples per epoch
     num_epochs = 300
-    updates_per_epoch = 200
+    updates_per_epoch = 10000 // 4  # 10k samples / batch_size = 2500 updates per epoch
     
     print(f"Starting training for {num_epochs} epochs...")
-    print(f"Each epoch has {updates_per_epoch} updates")
+    print(f"Each epoch has {updates_per_epoch} updates (10k samples)")
+    print(f"Validation uses FIXED 2.5k samples (same segments every epoch)")
     print(f"Total updates: {num_epochs * updates_per_epoch}")
+    print(f"Training folders: {train_folders}")
+    print(f"Validation folders: {val_folders}")
     
     # Custom training loop with wandb logging
     train_baseline_with_wandb(
