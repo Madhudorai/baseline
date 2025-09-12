@@ -365,8 +365,8 @@ def main():
             "dimension": 32,
             "causal": False,
             "epochs": 300,
-            "updates_per_epoch": 200,
-            "batch_size": 2,
+            "updates_per_epoch": 2000,
+            "batch_size": 4,
             "learning_rate": 3e-4,
             "beta1": 0.5,
             "beta2": 0.9,
@@ -446,7 +446,7 @@ def main():
     train_folders = ["Beach", "Busy Street", "Park", "Pedestrian Zone", "Quiet Street", "Shopping Centre"]
     val_folders = ["Woodland", "Train Station"]
     
-    # Create folder-based dataloaders with 10k train samples and 2.5k validation samples
+    # Create folder-based dataloaders with 8k train samples and 2k validation samples
     train_loader, val_loader = create_folder_based_dataloaders(
         audio_dir="/scratch/eigenscape/",
         train_folders=train_folders,
@@ -455,8 +455,8 @@ def main():
         sample_rate=24000,
         segment_duration=1.0,    
         channels=32,
-        train_dataset_size=10000,  # 10k training samples per epoch
-        val_dataset_size=2500,     # 2.5k validation samples (fixed each epoch)
+        train_dataset_size=8000,  # 2000 updates × 4 batch size = 8000 samples per epoch
+        val_dataset_size=2000,    # 2000 validation samples (fixed each epoch)
         min_file_duration=1.0,    
         random_crop=True,
         num_workers=0  # Disable multiprocessing to avoid crashes
@@ -468,13 +468,13 @@ def main():
     print(f"Training batches per epoch: {len(train_loader)}")
     print(f"Validation batches per epoch: {len(val_loader)}")
     
-    # Paper: 300 epochs, but now with 10k samples per epoch
+    # Paper: 300 epochs, 2000 updates per epoch
     num_epochs = 300
-    updates_per_epoch = 10000 // 4  # 10k samples / batch_size = 2500 updates per epoch
+    updates_per_epoch = 2000  # Paper: 2000 updates per epoch
     
     print(f"Starting training for {num_epochs} epochs...")
-    print(f"Each epoch has {updates_per_epoch} updates (10k samples)")
-    print(f"Validation uses FIXED 2.5k samples (same segments every epoch)")
+    print(f"Each epoch has {updates_per_epoch} updates (8k samples)")
+    print(f"Validation uses FIXED 2k samples (same segments every epoch)")
     print(f"Total updates: {num_epochs * updates_per_epoch}")
     print(f"Training folders: {train_folders}")
     print(f"Validation folders: {val_folders}")
