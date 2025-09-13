@@ -29,7 +29,8 @@ class MultiChannelAudioDataset(Dataset):
                  random_crop: bool = True,
                  file_extensions: tp.List[str] = None,
                  min_file_duration: float = None,
-                 max_segments_per_file: int = None):
+                 max_segments_per_file: int = None,
+                 cache_size: int = 100):  # Cache up to 100 files in memory
         """
         Args:
             audio_dir: Directory containing audio files
@@ -48,6 +49,8 @@ class MultiChannelAudioDataset(Dataset):
         self.segment_duration = segment_duration
         self.channels = channels
         self.pad = pad
+        self.cache_size = cache_size
+        self._audio_cache = {}  # Cache for loaded audio files
         self.random_crop = random_crop
         self.dataset_size = dataset_size
         self.min_file_duration = min_file_duration
@@ -105,19 +108,18 @@ class MultiChannelAudioDataset(Dataset):
         if self.dataset_size is not None:
             return self.dataset_size
         return len(self.audio_files)
-    
-    def __getitem__(self, index: int) -> torch.Tensor:
-        """Get a random segment from a random file.
+
+    def _load_audio_file(self, file_path: Path) -> torch.Tensor:
+        """Load and cache audio file."""
+        file_str = str(file_path)
         
-        If dataset_size is defined, this will always pick random files and segments.
-        If dataset_size is None, this will pick the file at the given index.
-        """
+        # Check cache first
+        if file_str in self._audio_cache:
+            return self._audio_cache[file_str]
         
-        # Always pick a random file for better variety
-        audio_file = random.choice(self.audio_files)
-        
+        # Load audio file
         try:
-            audio, sr = sf.read(str(audio_file), dtype=np.float32)
+            audio, sr = sf.read(file_str, dtype=np.float32)
             
             # (channels, samples)
             if len(audio.shape) == 1:
@@ -137,6 +139,34 @@ class MultiChannelAudioDataset(Dataset):
             # Resample
             if sr != self.sample_rate:
                 audio = self._resample(audio, sr, self.sample_rate)
+            
+            # Cache the audio (with LRU eviction if cache is full)
+            if len(self._audio_cache) >= self.cache_size:
+                # Remove oldest entry (simple FIFO)
+                oldest_key = next(iter(self._audio_cache))
+                del self._audio_cache[oldest_key]
+            
+            self._audio_cache[file_str] = audio
+            return audio
+            
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            # Return silence if file can't be loaded
+            target_samples = int(self.segment_duration * self.sample_rate)
+            return torch.zeros(self.channels, target_samples, dtype=torch.float32)
+    
+    def __getitem__(self, index: int) -> torch.Tensor:
+        """Get a random segment from a random file.
+        
+        If dataset_size is defined, this will always pick random files and segments.
+        If dataset_size is None, this will pick the file at the given index.
+        """
+        try:
+            # Always pick a random file for better variety
+            audio_file = random.choice(self.audio_files)
+            
+            # Use cached loading
+            audio = self._load_audio_file(audio_file)
             
             # Segmenting
             target_samples = int(self.segment_duration * self.sample_rate)
@@ -158,7 +188,7 @@ class MultiChannelAudioDataset(Dataset):
                     audio = audio[:, start:start + target_samples]
             
             return audio
-        
+            
         except Exception as e:
             print(f"Error loading {audio_file}: {e}")
             return torch.zeros(self.channels, int(self.segment_duration * self.sample_rate))
@@ -418,6 +448,8 @@ def create_folder_based_dataloaders(audio_dir: str,
     print(f"Found {len(val_files)} validation files from folders: {val_folders}")
     
     # Create training dataset
+    # Filter out DataLoader-specific parameters from kwargs
+    dataset_kwargs = {k: v for k, v in kwargs.items() if k not in ['pin_memory', 'num_workers', 'batch_size', 'persistent_workers']}
     train_dataset = MultiChannelAudioDataset(
         audio_dir=audio_dir,
         sample_rate=sample_rate,
@@ -425,7 +457,7 @@ def create_folder_based_dataloaders(audio_dir: str,
         channels=channels,
         dataset_size=train_dataset_size,
         min_file_duration=min_file_duration,
-        **kwargs
+        **dataset_kwargs
     )
     # Override the audio_files with our training files
     train_dataset.audio_files = train_files
@@ -446,7 +478,8 @@ def create_folder_based_dataloaders(audio_dir: str,
         batch_size=batch_size,
         shuffle=True,  # Shuffle training data
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=kwargs.get('pin_memory', False),
+        persistent_workers=kwargs.get('persistent_workers', False),
         drop_last=True
     )
     
@@ -455,7 +488,8 @@ def create_folder_based_dataloaders(audio_dir: str,
         batch_size=batch_size,
         shuffle=False,  # Don't shuffle validation data for consistent evaluation
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=kwargs.get('pin_memory', False),
+        persistent_workers=kwargs.get('persistent_workers', False),
         drop_last=True
     )
     

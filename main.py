@@ -455,13 +455,15 @@ def main():
         val_folders=val_folders,
         batch_size=4,           
         sample_rate=24000,
-        segment_duration=1.0,    
+        segment_duration=1.0,    # 1 second segments
         channels=32,
         train_dataset_size=8000,  # 2000 updates × 4 batch size = 8000 samples per epoch
         val_dataset_size=2000,    # 2000 validation samples (fixed each epoch)
         min_file_duration=1.0,    
         random_crop=True,
-        num_workers=0  # Disable multiprocessing to avoid crashes
+        num_workers=8,  # Enable multiprocessing for faster data loading
+        pin_memory=True,  # Enable pinned memory for faster GPU transfer
+        persistent_workers=True  # Keep workers alive between epochs
     )
     
     # Log dataset information
