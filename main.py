@@ -290,7 +290,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 val_metrics['val_adversarial_loss'] += adv_loss.item()
                 val_metrics['val_feature_matching_loss'] += feat_loss.item()
                 
-                # Use balancer for validation (in eval mode, no gradients)
+                # For validation, compute effective loss manually without using balancer.backward
+                # since we don't want to perform actual backward passes during validation
                 balanced_losses = {
                     'time_loss': time_loss,
                     'freq_loss': freq_loss,
@@ -298,11 +299,12 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     'feat_loss': feat_loss
                 }
                 
-                # For validation, we just compute the effective loss without backward pass
-                # We need to temporarily enable gradients for the balancer to work
-                reconstructed_audio.requires_grad_(True)
-                val_total = balancer.backward(balanced_losses, reconstructed_audio)
-                reconstructed_audio.requires_grad_(False)
+                # Compute effective loss using the same weights as the balancer
+                total_weights = sum(balancer.weights.values())
+                val_total = torch.tensor(0., device=batch.device, dtype=batch.dtype)
+                for name, loss in balanced_losses.items():
+                    weight = balancer.weights.get(name, 0.0)
+                    val_total += (weight / total_weights) * loss.detach()
                 
                 val_metrics['val_total_loss'] += val_total.item()
                 
