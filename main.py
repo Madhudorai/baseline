@@ -7,6 +7,8 @@ Based on the EnCodec paper: 300 epochs, 2000 updates per epoch, batch size 64.
 import logging
 import wandb
 import torch
+import argparse
+import time
 from pathlib import Path
 
 from model_builder import build_encodec_model
@@ -16,6 +18,15 @@ from adversarial_losses import create_adversarial_loss
 from balancer import Balancer
 
 logger = logging.getLogger(__name__)
+
+
+def parse_args():
+    """Parse command line arguments for 32ch vs 1ch configuration."""
+    parser = argparse.ArgumentParser(description='Baseline autoencoder training')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--32ch', action='store_true', help='Use 32-channel configuration')
+    group.add_argument('--1ch', action='store_true', help='Use 1-channel configuration')
+    return parser.parse_args()
 
 
 def setup_wandb():
@@ -74,7 +85,7 @@ def setup_wandb():
 
 def train_baseline_with_wandb(model, discriminator, train_loader, val_loader, 
                             model_optimizer, adversarial_loss,
-                            num_epochs, updates_per_epoch, save_path, device):
+                            num_epochs, updates_per_epoch, save_path, device, batch_size):
     """Custom training loop with comprehensive wandb logging for baseline autoencoder."""
     
     from losses import ReconstructionLoss
@@ -126,17 +137,36 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         # Training loop for this epoch
         for update in range(updates_per_epoch):
             try:
+                # Debug: Batch loading
+                print(f"DEBUG: Getting batch {update + 1}/{updates_per_epoch} for epoch {epoch + 1}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 # Get batch
                 batch = next(iter(train_loader))
-                if batch.shape[0] != 4:  # Skip incomplete batches
+                print(f"DEBUG: Got batch with shape {batch.shape}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # Check batch size (use dynamic batch size instead of hardcoded 4)
+                if batch.shape[0] != batch_size:  # Skip incomplete batches
+                    print(f"DEBUG: Skipping incomplete batch with size {batch.shape[0]} (expected {batch_size})")
                     continue
                 
                 # Move batch to device
+                print(f"DEBUG: Moved batch to device {device}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 batch = batch.to(device)
                 
                 # Forward pass: continuous embeddings → decoder → reconstructed audio
+                print(f"DEBUG: Starting forward pass for batch {update + 1}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 continuous_embeddings = model.encode(batch)
+                print(f"DEBUG: Encoded batch, embeddings shape: {continuous_embeddings.shape}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 reconstructed_audio = model.decode(continuous_embeddings)
+                print(f"DEBUG: Decoded audio, shape: {reconstructed_audio.shape}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Ensure same length
                 if reconstructed_audio.shape[-1] > batch.shape[-1]:
@@ -148,16 +178,29 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     )
                 
                 # Step 1: Train discriminator
+                print(f"DEBUG: Training discriminator for batch {update + 1}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 disc_loss = adversarial_loss.train_adv(
                     fake=reconstructed_audio.detach(),
                     real=batch
                 )
+                print(f"DEBUG: Discriminator loss: {disc_loss.item():.6f}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Step 2: Train generator (baseline autoencoder) with loss balancer
+                print(f"DEBUG: Training generator for batch {update + 1}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 model_optimizer.zero_grad()
                 
                 # Compute individual losses
+                print(f"DEBUG: Computing reconstruction loss")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
+                
+                print(f"DEBUG: Computing adversarial loss")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 adv_loss, feat_loss = adversarial_loss(reconstructed_audio, batch)
                 
                 # Split reconstruction loss into time and frequency components
@@ -165,15 +208,16 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 freq_loss = recon_metrics['freq_loss']
                 
                 # DEBUG: Print raw losses before balancer
-                if update == 0:  # Only print for first update
-                    print(f"DEBUG - Raw losses:")
-                    print(f"  recon_loss: {recon_loss.item():.6f}")
-                    print(f"  time_loss: {time_loss.item():.6f}")
-                    print(f"  freq_loss: {freq_loss.item():.6f}")
-                    print(f"  adv_loss: {adv_loss.item():.6f}")
-                    print(f"  feat_loss: {feat_loss.item():.6f}")
-                    print(f"  batch stats: min={batch.min().item():.6f}, max={batch.max().item():.6f}, mean={batch.mean().item():.6f}")
-                    print(f"  reconstructed stats: min={reconstructed_audio.min().item():.6f}, max={reconstructed_audio.max().item():.6f}, mean={reconstructed_audio.mean().item():.6f}")
+                print(f"DEBUG - Raw losses for batch {update + 1}:")
+                print(f"  recon_loss: {recon_loss.item():.6f}")
+                print(f"  time_loss: {time_loss.item():.6f}")
+                print(f"  freq_loss: {freq_loss.item():.6f}")
+                print(f"  adv_loss: {adv_loss.item():.6f}")
+                print(f"  feat_loss: {feat_loss.item():.6f}")
+                print(f"  disc_loss: {disc_loss.item():.6f}")
+                print(f"  batch stats: min={batch.min().item():.6f}, max={batch.max().item():.6f}, mean={batch.mean().item():.6f}")
+                print(f"  reconstructed stats: min={reconstructed_audio.min().item():.6f}, max={reconstructed_audio.max().item():.6f}, mean={reconstructed_audio.mean().item():.6f}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Use loss balancer for gradient balancing
                 balanced_losses = {
@@ -184,18 +228,25 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 }
                 
                 # Apply balancer - this handles gradient balancing and backward pass
+                print(f"DEBUG: Applying loss balancer for batch {update + 1}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 effective_loss = balancer.backward(balanced_losses, reconstructed_audio)
+                print(f"DEBUG: Effective loss: {effective_loss.item():.6f}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # DEBUG: Print effective loss and balancer metrics
-                if update == 0:
-                    print(f"DEBUG - Effective loss: {effective_loss.item():.6f}")
-                    print(f"DEBUG - Loss weights: λt=0.1, λf=1.0, λg=3.0, λfeat=3.0")
-                    print(f"DEBUG - Balancer metrics: {balancer.metrics}")
+                print(f"DEBUG - Loss weights: λt=0.1, λf=1.0, λg=3.0, λfeat=3.0")
+                print(f"DEBUG - Balancer metrics: {balancer.metrics}")
                 
                 # Gradient clipping
+                print(f"DEBUG: Applying gradient clipping")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 # Step the optimizer
+                print(f"DEBUG: Stepping optimizer for batch {update + 1}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 model_optimizer.step()
                 
                 # Update metrics
@@ -206,6 +257,10 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 train_metrics['feature_matching_loss'] += feat_loss.item()
                 train_metrics['total_loss'] += effective_loss.item()
                 train_metrics['discriminator_loss'] += disc_loss.item()
+                
+                print(f"DEBUG: Completed batch {update + 1}/{updates_per_epoch} for epoch {epoch + 1}")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("=" * 50)
                 
                 # Log to wandb every 100 steps
                 if global_step % 100 == 0:
@@ -257,7 +312,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         val_batches = 0
         with torch.no_grad():
             for batch in val_loader:
-                if batch.shape[0] != 4:  # Skip incomplete batches
+                if batch.shape[0] != batch_size:  # Skip incomplete batches
                     continue
                 
                 # Move batch to device
@@ -352,23 +407,38 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
 def main():
     """Baseline autoencoder training with paper-accurate parameters and wandb logging."""
     
+    # Parse command line arguments
+    args = parse_args()
+    
+    # Configure based on channel selection
+    if args.__dict__['32ch']:
+        channels = 32
+        batch_size = 4
+        config_name = "baseline-32ch-24khz"
+        print("Using 32-channel configuration")
+    else:  # 1ch
+        channels = 1
+        batch_size = 32
+        config_name = "baseline-1ch-24khz"
+        print("Using 1-channel configuration")
+    
     # Setup wandb (will handle login if needed)
     setup_wandb()
     
     # Initialize wandb
     wandb.init(
         project="baseline-autoencoder-training",
-        name="baseline-24khz-paper-params",
+        name=config_name,
         config={
             "sample_rate": 24000,
-            "channels": 32,
+            "channels": channels,
             "n_filters": 4,
             "n_residual_layers": 1,
             "dimension": 32,
             "causal": False,
             "epochs": 300,
             "updates_per_epoch": 2000,
-            "batch_size": 4,
+            "batch_size": batch_size,
             "learning_rate": 3e-4,
             "beta1": 0.5,
             "beta2": 0.9,
@@ -398,7 +468,7 @@ def main():
     print("Building baseline autoencoder model...")
     model = build_encodec_model(
         sample_rate=24000,
-        channels=32,
+        channels=channels,
         n_filters=4,
         n_residual_layers=1,
         dimension=32,
@@ -408,7 +478,7 @@ def main():
     # Build MS-STFT discriminator
     print("Building MS-STFT discriminator...")
     discriminator = create_ms_stft_discriminator(
-        in_channels=32,
+        in_channels=channels,
         out_channels=1,
         filters=32
     ).to(device)
@@ -448,20 +518,20 @@ def main():
     train_folders = ["Beach", "Busy Street", "Park", "Pedestrian Zone", "Quiet Street", "Shopping Centre"]
     val_folders = ["Woodland", "Train Station"]
     
-    # Create folder-based dataloaders with 8k train samples and 2k validation samples
+    # Create folder-based dataloaders with dynamic configuration
     train_loader, val_loader = create_folder_based_dataloaders(
         audio_dir="/scratch/eigenscape/",
         train_folders=train_folders,
         val_folders=val_folders,
-        batch_size=4,           
+        batch_size=batch_size,           
         sample_rate=24000,
         segment_duration=1.0,    # 1 second segments
-        channels=32,
-        train_dataset_size=8000,  # 2000 updates × 4 batch size = 8000 samples per epoch
+        channels=channels,
+        train_dataset_size=8000,  # 2000 updates × batch_size = 8000 samples per epoch
         val_dataset_size=2000,    # 2000 validation samples (fixed each epoch)
         min_file_duration=1.0,    
         random_crop=True,
-        num_workers=8,  # Enable multiprocessing for faster data loading
+        num_workers=4,  # Enable multiprocessing for faster data loading
         pin_memory=True,  # Enable pinned memory for faster GPU transfer
         persistent_workers=True  # Keep workers alive between epochs
     )
@@ -494,7 +564,8 @@ def main():
         num_epochs=num_epochs,
         updates_per_epoch=updates_per_epoch,
         save_path=Path("best_model.pth"),
-        device=device
+        device=device,
+        batch_size=batch_size
     )
     
     print("Training completed!")
