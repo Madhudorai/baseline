@@ -228,12 +228,8 @@ class FeatureMatchingLoss(nn.Module):
         for (feat_fake, feat_real) in zip(fmap_fake, fmap_real):
             assert feat_fake.shape == feat_real.shape
             n_fmaps += 1
-            # Normalize by real feature magnitude as per paper equation (2)
-            feat_scale = torch.mean(torch.abs(feat_real))
-            if feat_scale > 0:
-                feat_loss += self.loss(feat_fake, feat_real) / feat_scale
-            else:
-                feat_loss += self.loss(feat_fake, feat_real)
+            feat_loss += self.loss(feat_fake, feat_real)
+            feat_scale += torch.mean(torch.abs(feat_real))
 
         if self.normalize:
             feat_loss /= n_fmaps

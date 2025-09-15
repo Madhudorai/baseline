@@ -5,6 +5,7 @@ Based on the EnCodec paper: 300 epochs, 2000 updates per epoch, batch size 64.
 """
 
 import logging
+import random
 import wandb
 import torch
 import argparse
@@ -85,7 +86,7 @@ def setup_wandb():
 
 def train_baseline_with_wandb(model, discriminator, train_loader, val_loader, 
                             model_optimizer, adversarial_loss,
-                            num_epochs, updates_per_epoch, save_path, device, batch_size):
+                            num_epochs, updates_per_epoch, save_path, device, batch_size, sample_rate=24000):
     """Custom training loop with comprehensive wandb logging for baseline autoencoder."""
     
     from losses import ReconstructionLoss
@@ -131,6 +132,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
             'feature_matching_loss': 0.0,
             'total_loss': 0.0,
             'discriminator_loss': 0.0,
+            'discriminator_updates': 0,  # Track discriminator update frequency
             'learning_rate': model_optimizer.param_groups[0]['lr']
         }
         
@@ -177,15 +179,27 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         reconstructed_audio, (0, pad_length), mode='reflect'
                     )
                 
-                # Step 1: Train discriminator
+                # Step 1: Train discriminator (probabilistic - 2/3 probability for 24kHz)
                 print(f"DEBUG: Training discriminator for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                disc_loss = adversarial_loss.train_adv(
-                    fake=reconstructed_audio.detach(),
-                    real=batch
-                )
-                print(f"DEBUG: Discriminator loss: {disc_loss.item():.6f}")
+                # Paper: 2/3 probability for 24kHz, 0.5 for 48kHz
+                if sample_rate == 24000:
+                    discriminator_update_prob = 2/3  # 66.7% for 24kHz
+                elif sample_rate == 48000:
+                    discriminator_update_prob = 0.5  # 50% for 48kHz
+                else:
+                    discriminator_update_prob = 2/3  # Default to 24kHz rate
+                if random.random() < discriminator_update_prob:
+                    disc_loss = adversarial_loss.train_adv(
+                        fake=reconstructed_audio.detach(),
+                        real=batch
+                    )
+                    train_metrics['discriminator_updates'] += 1
+                    print(f"DEBUG: Discriminator updated (prob={discriminator_update_prob:.2f}) - Loss: {disc_loss.item():.6f}")
+                else:
+                    disc_loss = torch.tensor(0.0, device=batch.device)
+                    print(f"DEBUG: Discriminator skipped (prob={discriminator_update_prob:.2f}) - Loss: 0.000000")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Step 2: Train generator (baseline autoencoder) with loss balancer
@@ -272,6 +286,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         'train/feature_matching_loss': feat_loss.item(),
                         'train/effective_loss': effective_loss.item(),
                         'train/discriminator_loss': disc_loss.item(),
+                        'train/discriminator_updates': train_metrics['discriminator_updates'],
                         'train/learning_rate': model_optimizer.param_groups[0]['lr'],
                         'epoch': epoch,
                         'global_step': global_step,
@@ -380,6 +395,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
             'train/epoch_feature_matching_loss': train_metrics['feature_matching_loss'],
             'train/epoch_total_loss': train_metrics['total_loss'],
             'train/epoch_discriminator_loss': train_metrics['discriminator_loss'],
+            'train/epoch_discriminator_updates': train_metrics['discriminator_updates'],
             **val_metrics
         })
         
@@ -397,10 +413,12 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
             print(f"Saved best model with validation loss: {best_val_loss:.6f}")
         
         # Log epoch summary
+        disc_update_rate = train_metrics['discriminator_updates'] / updates_per_epoch * 100
         print(f"Epoch {epoch + 1}/{num_epochs} completed:")
         print(f"  Train - Recon: {train_metrics['reconstruction_loss']:.6f}, "
                    f"Adv: {train_metrics['adversarial_loss']:.6f}, "
                    f"Feat: {train_metrics['feature_matching_loss']:.6f}")
+        print(f"  Discriminator - Updates: {train_metrics['discriminator_updates']}/{updates_per_epoch} ({disc_update_rate:.1f}%)")
         print(f"  Val - Total: {val_metrics['val_total_loss']:.6f}")
 
 
@@ -554,19 +572,20 @@ def main():
     print(f"Validation folders: {val_folders}")
     
     # Custom training loop with wandb logging
-    train_baseline_with_wandb(
-        model=model,
-        discriminator=discriminator,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        model_optimizer=model_optimizer,
-        adversarial_loss=adversarial_loss,
-        num_epochs=num_epochs,
-        updates_per_epoch=updates_per_epoch,
-        save_path=Path("best_model.pth"),
-        device=device,
-        batch_size=batch_size
-    )
+        train_baseline_with_wandb(
+            model=model,
+            discriminator=discriminator,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            model_optimizer=model_optimizer,
+            adversarial_loss=adversarial_loss,
+            num_epochs=num_epochs,
+            updates_per_epoch=updates_per_epoch,
+            save_path=Path("best_model.pth"),
+            device=device,
+            batch_size=batch_size,
+            sample_rate=sample_rate
+        )
     
     print("Training completed!")
     wandb.finish()

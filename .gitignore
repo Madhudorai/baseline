@@ -3,3 +3,5 @@ venv/
 encodec_training.egg-info/
 .DS_Store
 __pycache__/
+audiocraft/
+
