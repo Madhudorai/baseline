@@ -132,7 +132,13 @@ class MultiChannelAudioDataset(Dataset):
                 padding = np.zeros((self.channels - audio.shape[0], audio.shape[1]), dtype=np.float32)
                 audio = np.vstack([audio, padding])
             elif audio.shape[0] > self.channels:
-                audio = audio[:self.channels, :]
+                if self.channels == 1:
+                    # For 1-channel mode, randomly pick one of the available channels
+                    random_channel_idx = random.randint(0, audio.shape[0] - 1)
+                    audio = audio[random_channel_idx:random_channel_idx + 1, :]
+                else:
+                    # For multi-channel mode, take the first N channels
+                    audio = audio[:self.channels, :]
             
             audio = torch.from_numpy(audio).float()
             
@@ -332,7 +338,13 @@ class FixedValidationDataset(Dataset):
                 padding = np.zeros((self.channels - audio.shape[0], audio.shape[1]), dtype=np.float32)
                 audio = np.vstack([audio, padding])
             elif audio.shape[0] > self.channels:
-                audio = audio[:self.channels, :]
+                if self.channels == 1:
+                    # For 1-channel mode, randomly pick one of the available channels
+                    random_channel_idx = random.randint(0, audio.shape[0] - 1)
+                    audio = audio[random_channel_idx:random_channel_idx + 1, :]
+                else:
+                    # For multi-channel mode, take the first N channels
+                    audio = audio[:self.channels, :]
             
             audio = torch.from_numpy(audio).float()
             

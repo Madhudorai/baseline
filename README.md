@@ -15,85 +15,80 @@ pip install -e .
 
 ## Quick Start
 
-```python
-from baseline_training import build_encodec_model, create_dataloader, train_model
+**You must specify either `--1ch` or `--32ch` when running the training script:**
 
-# Build model
-model = build_encodec_model(
-    sample_rate=24000,
-    channels=32,
-    n_filters=4,
-    n_residual_layers=1,
-    dimension=32
-)
+```bash
+# For 1-channel (mono) training
+python main.py --1ch
 
-# Create dataloader
-train_loader = create_dataloader(
-    audio_dir="/path/to/audio",
-    batch_size=8,
-    channels=32,
-    segment_duration=10.0
-)
-
-# Advanced: Get multiple samples from each file
-large_loader = create_dataloader(
-    audio_dir="/path/to/audio",
-    batch_size=8,
-    channels=32,
-    segment_duration=10.0,
-    dataset_size=1000,        # Get 1000 samples total
-    min_file_duration=5.0,    # Only files longer than 5s
-    random_crop=True          # Random segments for variety
-)
-
-# Train
-train_model(model, train_loader, val_loader, num_epochs=100)
+# For 32-channel (multichannel) training  
+python main.py --32ch
 ```
 
-## Advanced Usage: Adversarial Training with Weighted Loss
+## Configuration Differences
 
-```python
-from baseline_training import (
-    build_encodec_model, 
-    create_ms_stft_discriminator,
-    create_adversarial_loss
-)
+### 1-Channel Mode (`--1ch`)
+- **Channels**: 1 (mono audio)
+- **Batch Size**: 32 (larger batches for better gradient estimates)
+- **Data Loading**: Randomly selects one channel from 32-channel source files
+- **Model**: SEANet encoder/decoder configured for 1 input channel
+- **Discriminator**: MS-STFT discriminator with 1 input channel
+- **Use Case**: Standard mono audio compression, faster training
 
-# Build model and discriminator
-model = build_encodec_model(sample_rate=24000, channels=32)
-discriminator = create_ms_stft_discriminator(in_channels=32)
+### 32-Channel Mode (`--32ch`)
+- **Channels**: 32 (multichannel audio)
+- **Batch Size**: 4 (smaller batches due to memory constraints)
+- **Data Loading**: Uses all 32 channels from source files
+- **Model**: SEANet encoder/decoder configured for 32 input channels
+- **Discriminator**: MS-STFT discriminator with 32 input channels
+- **Use Case**: Multichannel audio compression, spatial audio processing
 
-# Create adversarial loss
-adversarial_loss = create_adversarial_loss(
-    discriminator=discriminator,
-    optimizer=disc_optimizer,
-    loss_type='hinge'
-)
+## Training Parameters
 
-# Loss weights (paper parameters)
-reconstruction_weight = 1.0      # Main loss
-adversarial_weight = 3.0         # Adversarial loss  
-feature_matching_weight = 3.0    # Feature matching loss
+Both modes use the same core training parameters:
+- **Sample Rate**: 24kHz
+- **Segment Duration**: 1 second
+- **Epochs**: 300
+- **Updates per Epoch**: 2000
+- **Learning Rate**: 3e-4
+- **Loss Weights**: λt=0.1, λf=1.0, λg=3.0, λfeat=3.0
 
-# Training loop with weighted loss
-total_loss = (reconstruction_weight * recon_loss + 
-             adversarial_weight * adv_loss + 
-             feature_matching_weight * feat_loss)
+## Data Loading Strategy
 
-total_loss.backward()
-```
+The dataloader automatically handles channel conversion:
+- **1-channel mode**: Randomly picks one of the 32 available channels from each file
+- **32-channel mode**: Uses all 32 channels from each file
+- **Random sampling**: Each training sample comes from a random file and random time segment
+- **Fixed validation**: Validation uses the same segments every epoch for consistent evaluation
+
+## Training Process
+
+The training script automatically handles:
+- **Model Building**: Creates SEANet encoder/decoder with appropriate channel configuration
+- **Discriminator Setup**: MS-STFT discriminator with matching input channels
+- **Loss Balancing**: Gradient-balanced loss combination with paper-accurate weights
+- **Wandb Logging**: Automatic experiment tracking and visualization
+- **Model Saving**: Best model checkpointing based on validation loss
+
+## Data Requirements
+
+- **Audio Directory**: Place your audio files in `/scratch/eigenscape/`
+- **File Format**: `.wav` files (any sample rate, will be resampled to 24kHz)
+- **Channel Count**: Source files should have 32 channels for proper operation
+- **Duration**: Files should be at least 1 second long (configurable)
 
 ## Features
 
+- **Dual Channel Modes**: Support for both 1-channel (mono) and 32-channel (multichannel) training
 - **Baseline Autoencoder**: Continuous embedding encoder-decoder without quantization
 - **SEANet Architecture**: State-of-the-art neural audio architecture  
 - **Reconstruction Losses**: Time domain (L1) + Frequency domain (multi-scale mel-spectrogram)
 - **MS-STFT Discriminator**: Multi-scale STFT-based discriminator for adversarial training
 - **Adversarial Training**: Complete GAN-style training with hinge losses
-- **Weighted Loss**: Simple weighted combination of reconstruction, adversarial, and feature matching losses
-- **Smart Dataloader**: Get multiple samples from each audio file with random segments
-- **Multichannel Audio Support**: Load and process multichannel .wav files (1, 2, 32, 64+ channels)
-- **Modular Design**: Clean separation of concerns for easy customization
+- **Gradient Balancing**: Advanced loss balancing for stable training
+- **Smart Dataloader**: Random channel selection for 1ch mode, random file/segment sampling
+- **Wandb Integration**: Automatic experiment tracking and visualization
+- **Paper-Accurate**: Implements EnCodec paper parameters (300 epochs, 2000 updates/epoch)
 
 ## Requirements
 
