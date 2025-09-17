@@ -383,7 +383,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
             **val_metrics
         })
         
-        # Save best model
+        # Save best model (simplified - no wandb config to avoid loading issues)
         if val_metrics['val_total_loss'] < best_val_loss:
             best_val_loss = val_metrics['val_total_loss']
             torch.save({
@@ -391,8 +391,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 'model_state_dict': model.state_dict(),
                 'discriminator_state_dict': discriminator.state_dict(),
                 'model_optimizer_state_dict': model_optimizer.state_dict(),
-                'val_loss': best_val_loss,
-                'config': wandb.config
+                'val_loss': best_val_loss
             }, save_path)
             print(f"Saved best model with validation loss: {best_val_loss:.6f}")
         
