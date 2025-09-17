@@ -285,7 +285,7 @@ class FixedValidationDataset(Dataset):
         # Pre-generate fixed segments
         self.fixed_segments = self._generate_fixed_segments()
     
-    def _generate_fixed_segments(self) -> tp.List[tp.Tuple[Path, int]]:
+    def _generate_fixed_segments(self) -> tp.List[tp.Tuple[Path, int, int]]:
         """Pre-generate fixed segments (file_path, start_sample) for consistent validation."""
         segments = []
         
@@ -309,7 +309,23 @@ class FixedValidationDataset(Dataset):
                         start_sample = random.randint(0, file_samples - segment_samples)
                     else:
                         start_sample = 0
-                    segments.append((file_path, start_sample))
+                    
+                    # For 1-channel mode, also pre-generate the channel selection
+                    if self.channels == 1:
+                        # Load file to get channel count for random selection
+                        try:
+                            audio, _ = sf.read(str(file_path), dtype=np.float32)
+                            if len(audio.shape) == 2:
+                                num_channels = audio.shape[1]  # soundfile loads as (samples, channels)
+                            else:
+                                num_channels = 1
+                            channel_idx = random.randint(0, num_channels - 1)
+                        except:
+                            channel_idx = 0  # fallback to first channel
+                    else:
+                        channel_idx = 0  # not used for multi-channel mode
+                    
+                    segments.append((file_path, start_sample, channel_idx))
                     
             except Exception as e:
                 print(f"Warning: Could not process {file_path}: {e}")
@@ -322,7 +338,7 @@ class FixedValidationDataset(Dataset):
     
     def __getitem__(self, index: int) -> torch.Tensor:
         """Get a fixed segment."""
-        file_path, start_sample = self.fixed_segments[index]
+        file_path, start_sample, channel_idx = self.fixed_segments[index]
         
         try:
             audio, sr = sf.read(str(file_path), dtype=np.float32)
@@ -339,9 +355,8 @@ class FixedValidationDataset(Dataset):
                 audio = np.vstack([audio, padding])
             elif audio.shape[0] > self.channels:
                 if self.channels == 1:
-                    # For 1-channel mode, randomly pick one of the available channels
-                    random_channel_idx = random.randint(0, audio.shape[0] - 1)
-                    audio = audio[random_channel_idx:random_channel_idx + 1, :]
+                    # For 1-channel mode, use the pre-generated fixed channel selection
+                    audio = audio[channel_idx:channel_idx + 1, :]
                 else:
                     # For multi-channel mode, take the first N channels
                     audio = audio[:self.channels, :]

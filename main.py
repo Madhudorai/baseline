@@ -9,6 +9,8 @@ import wandb
 import torch
 import argparse
 import time
+import soundfile as sf
+import numpy as np
 from pathlib import Path
 
 from model_builder import build_encodec_model
@@ -18,6 +20,75 @@ from adversarial_losses import create_adversarial_loss
 from balancer import Balancer
 
 logger = logging.getLogger(__name__)
+
+
+def save_audio_samples_to_wandb(original_audio, reconstructed_audio, epoch, sample_rate=24000):
+    """Save audio samples as wandb artifacts for monitoring reconstruction quality.
+    
+    Args:
+        original_audio: Original audio tensor (batch, channels, samples)
+        reconstructed_audio: Reconstructed audio tensor (batch, channels, samples)
+        epoch: Current epoch number
+        sample_rate: Audio sample rate
+    """
+    import tempfile
+    import os
+    
+    # Take first 5 samples from the batch
+    num_samples = min(5, original_audio.shape[0])
+    
+    # Create temporary directory for audio files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        
+        # Prepare audio files for wandb
+        audio_files = []
+        
+        for i in range(num_samples):
+            # Convert to numpy and transpose to (samples, channels) for soundfile
+            orig_np = original_audio[i].detach().cpu().numpy().T
+            recon_np = reconstructed_audio[i].detach().cpu().numpy().T
+            
+            # Save original audio
+            orig_filename = temp_path / f"epoch_{epoch:03d}_sample_{i}_original.wav"
+            sf.write(orig_filename, orig_np, sample_rate)
+            
+            # Save reconstructed audio
+            recon_filename = temp_path / f"epoch_{epoch:03d}_sample_{i}_reconstructed.wav"
+            sf.write(recon_filename, recon_np, sample_rate)
+            
+            # Add to wandb files list
+            audio_files.append(str(orig_filename))
+            audio_files.append(str(recon_filename))
+            
+            print(f"Prepared audio samples: {orig_filename.name}, {recon_filename.name}")
+        
+        # Create wandb artifact
+        artifact = wandb.Artifact(
+            name=f"audio_samples_epoch_{epoch:03d}",
+            type="audio_samples",
+            description=f"Original and reconstructed audio samples from epoch {epoch}"
+        )
+        
+        # Add all audio files to the artifact
+        for audio_file in audio_files:
+            artifact.add_file(audio_file)
+        
+        # Log the artifact to wandb
+        wandb.log_artifact(artifact)
+        print(f"Uploaded audio samples for epoch {epoch} to wandb as artifact: audio_samples_epoch_{epoch:03d}")
+        
+        # Also log individual audio files to wandb media for easy playback
+        wandb_media = {}
+        for i in range(num_samples):
+            orig_file = temp_path / f"epoch_{epoch:03d}_sample_{i}_original.wav"
+            recon_file = temp_path / f"epoch_{epoch:03d}_sample_{i}_reconstructed.wav"
+            
+            wandb_media[f"audio/epoch_{epoch:03d}_sample_{i}_original"] = wandb.Audio(str(orig_file), sample_rate=sample_rate)
+            wandb_media[f"audio/epoch_{epoch:03d}_sample_{i}_reconstructed"] = wandb.Audio(str(recon_file), sample_rate=sample_rate)
+        
+        # Log audio media to wandb
+        wandb.log(wandb_media)
 
 
 def parse_args():
@@ -310,8 +381,11 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         }
         
         val_batches = 0
+        first_batch_audio = None  # Store first batch for audio saving
+        first_batch_reconstructed = None
+        
         with torch.no_grad():
-            for batch in val_loader:
+            for batch_idx, batch in enumerate(val_loader):
                 if batch.shape[0] != batch_size:  # Skip incomplete batches
                     continue
                 
@@ -330,6 +404,11 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     reconstructed_audio = torch.nn.functional.pad(
                         reconstructed_audio, (0, pad_length), mode='reflect'
                     )
+                
+                # Store first batch for audio saving (every 10 epochs)
+                if batch_idx == 0 and (epoch + 1) % 10 == 0:
+                    first_batch_audio = batch.clone()
+                    first_batch_reconstructed = reconstructed_audio.clone()
                 
                 # Compute losses
                 recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
@@ -369,6 +448,16 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         if val_batches > 0:
             for key in val_metrics:
                 val_metrics[key] /= val_batches
+        
+        # Save audio samples every 10 epochs
+        if (epoch + 1) % 10 == 0 and first_batch_audio is not None and first_batch_reconstructed is not None:
+            print(f"Saving audio samples for epoch {epoch + 1}...")
+            save_audio_samples_to_wandb(
+                original_audio=first_batch_audio,
+                reconstructed_audio=first_batch_reconstructed,
+                epoch=epoch + 1,
+                sample_rate=24000
+            )
         
         # Log epoch metrics to wandb
         wandb.log({
