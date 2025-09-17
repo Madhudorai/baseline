@@ -22,6 +22,19 @@ from balancer import Balancer
 logger = logging.getLogger(__name__)
 
 
+def get_discriminator_input(audio_tensor, channels, channel_idx=None):
+    """Get input for discriminator - use random channel for 32ch mode to save memory."""
+    if channels == 32:
+        # For 32ch mode, use a random channel for discriminator
+        if channel_idx is None:
+            # Pick a random channel if not specified
+            channel_idx = torch.randint(0, audio_tensor.shape[1], (1,)).item()
+        return audio_tensor[:, channel_idx:channel_idx + 1, :]  # Keep channel dimension
+    else:
+        # For 1ch mode, use as is
+        return audio_tensor
+
+
 def save_audio_samples_to_wandb(original_audio, reconstructed_audio, epoch, sample_rate=24000):
     """Save audio samples as wandb artifacts for monitoring reconstruction quality.
     
@@ -156,7 +169,7 @@ def setup_wandb():
 
 def train_baseline_with_wandb(model, discriminator, train_loader, val_loader, 
                             model_optimizer, adversarial_loss,
-                            num_epochs, updates_per_epoch, save_path, device, batch_size):
+                            num_epochs, updates_per_epoch, save_path, device, batch_size, channels):
     """Custom training loop with comprehensive wandb logging for baseline autoencoder."""
     
     from losses import ReconstructionLoss
@@ -252,9 +265,18 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"DEBUG: Training discriminator for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
+                # Use same random channel for both original and reconstructed in 32ch mode
+                if channels == 32:
+                    channel_idx = torch.randint(0, batch.shape[1], (1,)).item()
+                    disc_fake = get_discriminator_input(reconstructed_audio.detach(), channels, channel_idx)
+                    disc_real = get_discriminator_input(batch, channels, channel_idx)
+                else:
+                    disc_fake = get_discriminator_input(reconstructed_audio.detach(), channels)
+                    disc_real = get_discriminator_input(batch, channels)
+                
                 disc_loss = adversarial_loss.train_adv(
-                    fake=reconstructed_audio.detach(),
-                    real=batch
+                    fake=disc_fake,
+                    real=disc_real
                 )
                 print(f"DEBUG: Discriminator loss: {disc_loss.item():.6f}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -272,7 +294,15 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 
                 print(f"DEBUG: Computing adversarial loss")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
-                adv_loss, feat_loss = adversarial_loss(reconstructed_audio, batch)
+                # Use same random channel for both original and reconstructed in 32ch mode
+                if channels == 32:
+                    # Use the same channel_idx that was used for discriminator training
+                    adv_fake = get_discriminator_input(reconstructed_audio, channels, channel_idx)
+                    adv_real = get_discriminator_input(batch, channels, channel_idx)
+                else:
+                    adv_fake = get_discriminator_input(reconstructed_audio, channels)
+                    adv_real = get_discriminator_input(batch, channels)
+                adv_loss, feat_loss = adversarial_loss(adv_fake, adv_real)
                 
                 # Split reconstruction loss into time and frequency components
                 time_loss = recon_metrics['time_loss']
@@ -412,7 +442,15 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 
                 # Compute losses
                 recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
-                adv_loss, feat_loss = adversarial_loss(reconstructed_audio, batch)
+                # Use same random channel for both original and reconstructed in 32ch mode
+                if channels == 32:
+                    channel_idx = torch.randint(0, batch.shape[1], (1,)).item()
+                    adv_fake = get_discriminator_input(reconstructed_audio, channels, channel_idx)
+                    adv_real = get_discriminator_input(batch, channels, channel_idx)
+                else:
+                    adv_fake = get_discriminator_input(reconstructed_audio, channels)
+                    adv_real = get_discriminator_input(batch, channels)
+                adv_loss, feat_loss = adversarial_loss(adv_fake, adv_real)
                 
                 # Split reconstruction loss into time and frequency components
                 time_loss = recon_metrics['time_loss']
@@ -565,8 +603,10 @@ def main():
     
     # Build MS-STFT discriminator
     print("Building MS-STFT discriminator...")
+    # Use 1 channel for discriminator input to save memory (even for 32ch mode)
+    disc_input_channels = 1 if channels == 32 else channels
     discriminator = create_ms_stft_discriminator(
-        in_channels=channels,
+        in_channels=disc_input_channels,
         out_channels=1,
         filters=32
     ).to(device)
@@ -642,6 +682,12 @@ def main():
     print(f"Validation folders: {val_folders}")
     
     # Custom training loop with wandb logging
+    # Use different model names for different channel modes
+    if channels == 32:
+        save_path = Path("bestmodel_32ch.pth")
+    else:  # 1ch
+        save_path = Path("bestmodel.pth")
+    
     train_baseline_with_wandb(
         model=model,
         discriminator=discriminator,
@@ -651,9 +697,10 @@ def main():
         adversarial_loss=adversarial_loss,
         num_epochs=num_epochs,
         updates_per_epoch=updates_per_epoch,
-        save_path=Path("best_model.pth"),
+        save_path=save_path,
         device=device,
-        batch_size=batch_size
+        batch_size=batch_size,
+        channels=channels
     )
     
     print("Training completed!")
