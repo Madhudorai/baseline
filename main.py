@@ -13,7 +13,7 @@ import soundfile as sf
 import numpy as np
 from pathlib import Path
 
-from model_builder import build_encodec_model
+from model_builder import build_encodec_model, build_quantized_encodec_model
 from dataloader import create_train_test_dataloaders, create_folder_based_dataloaders
 from discriminators import create_ms_stft_discriminator
 from adversarial_losses import create_adversarial_loss
@@ -105,11 +105,12 @@ def save_audio_samples_to_wandb(original_audio, reconstructed_audio, epoch, samp
 
 
 def parse_args():
-    """Parse command line arguments for 32ch vs 1ch configuration."""
+    """Parse command line arguments for 32ch vs 1ch vs 1chtoken configuration."""
     parser = argparse.ArgumentParser(description='Baseline autoencoder training')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--32ch', action='store_true', help='Use 32-channel configuration')
     group.add_argument('--1ch', action='store_true', help='Use 1-channel configuration')
+    group.add_argument('--1chtoken', action='store_true', help='Use 1-channel configuration with quantization/tokenization')
     return parser.parse_args()
 
 
@@ -169,7 +170,7 @@ def setup_wandb():
 
 def train_baseline_with_wandb(model, discriminator, train_loader, val_loader, 
                             model_optimizer, adversarial_loss,
-                            num_epochs, updates_per_epoch, save_path, device, batch_size, channels):
+                            num_epochs, updates_per_epoch, save_path, device, batch_size, channels, use_quantization=False):
     """Custom training loop with comprehensive wandb logging for baseline autoencoder."""
     
     from losses import ReconstructionLoss
@@ -185,6 +186,9 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         'adv_loss': 3.0,       # λg - adversarial loss
         'feat_loss': 3.0       # λfeat - feature matching loss
     }
+    
+    # Note: quantization penalty (commitment loss) is NOT included in loss weights
+    # as it's handled separately per EnCodec paper
     
     balancer = Balancer(
         weights=loss_weights,
@@ -218,6 +222,14 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
             'learning_rate': model_optimizer.param_groups[0]['lr']
         }
         
+        # Add quantization metrics if using quantization
+        if use_quantization:
+            train_metrics.update({
+                'quantization_penalty': 0.0,
+                'bandwidth_kbps': 0.0,
+                'codes_entropy': 0.0
+            })
+        
         # Training loop for this epoch
         for update in range(updates_per_epoch):
             try:
@@ -244,11 +256,27 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"DEBUG: Starting forward pass for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                continuous_embeddings = model.encode(batch)
-                print(f"DEBUG: Encoded batch, embeddings shape: {continuous_embeddings.shape}")
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                if use_quantization:
+                    # For quantized model, use forward() to get QuantizedResult
+                    quantized_result = model(batch)
+                    reconstructed_audio = quantized_result.x
+                    quantization_penalty = quantized_result.penalty
+                    codes = quantized_result.codes
+                    bandwidth = quantized_result.bandwidth
+                    print(f"DEBUG: Quantized batch, reconstructed shape: {reconstructed_audio.shape}")
+                    print(f"DEBUG: Codes shape: {codes.shape}, Penalty: {quantization_penalty.item():.6f}")
+                    print(f"DEBUG: Bandwidth: {bandwidth.item():.6f} kbps")
+                else:
+                    # For baseline model, use encode/decode
+                    continuous_embeddings = model.encode(batch)
+                    print(f"DEBUG: Encoded batch, embeddings shape: {continuous_embeddings.shape}")
+                    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    reconstructed_audio = model.decode(continuous_embeddings)
+                    quantization_penalty = torch.tensor(0.0, device=device)
+                    codes = None
+                    bandwidth = torch.tensor(0.0, device=device)
                 
-                reconstructed_audio = model.decode(continuous_embeddings)
                 print(f"DEBUG: Decoded audio, shape: {reconstructed_audio.shape}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
@@ -316,6 +344,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"  adv_loss: {adv_loss.item():.6f}")
                 print(f"  feat_loss: {feat_loss.item():.6f}")
                 print(f"  disc_loss: {disc_loss.item():.6f}")
+                if use_quantization:
+                    print(f"  quantization_penalty: {quantization_penalty.item():.6f}")
                 print(f"  batch stats: min={batch.min().item():.6f}, max={batch.max().item():.6f}, mean={batch.mean().item():.6f}")
                 print(f"  reconstructed stats: min={reconstructed_audio.min().item():.6f}, max={reconstructed_audio.max().item():.6f}, mean={reconstructed_audio.mean().item():.6f}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -328,6 +358,9 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     'feat_loss': feat_loss
                 }
                 
+                # Note: quantization_penalty (commitment loss) is NOT included in balancer
+                # as per EnCodec paper - it applies only to encoder, not model output
+                
                 # Apply balancer - this handles gradient balancing and backward pass
                 print(f"DEBUG: Applying loss balancer for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -335,6 +368,12 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 effective_loss = balancer.backward(balanced_losses, reconstructed_audio)
                 print(f"DEBUG: Effective loss: {effective_loss.item():.6f}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # Add commitment loss separately (not in balancer per EnCodec paper)
+                if use_quantization:
+                    effective_loss = effective_loss + quantization_penalty
+                    print(f"DEBUG: Added commitment loss: {quantization_penalty.item():.6f}")
+                    print(f"DEBUG: Total loss with commitment: {effective_loss.item():.6f}")
                 
                 # DEBUG: Print effective loss and balancer metrics
                 print(f"DEBUG - Loss weights: λt=0.1, λf=1.0, λg=3.0, λfeat=3.0")
@@ -359,6 +398,24 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 train_metrics['total_loss'] += effective_loss.item()
                 train_metrics['discriminator_loss'] += disc_loss.item()
                 
+                # Update quantization metrics if using quantization
+                if use_quantization:
+                    train_metrics['quantization_penalty'] += quantization_penalty.item()
+                    train_metrics['bandwidth_kbps'] += bandwidth.item()
+                    
+                    # Calculate codes entropy (diversity measure)
+                    if codes is not None:
+                        # Calculate entropy for each codebook
+                        codes_flat = codes.reshape(-1, codes.shape[1])  # [B*T, n_q]
+                        entropy_sum = 0.0
+                        for q in range(codes_flat.shape[1]):
+                            code_counts = torch.bincount(codes_flat[:, q], minlength=model.quantizer.codebook_size)
+                            probs = code_counts.float() / code_counts.sum()
+                            probs = probs[probs > 0]  # Remove zero probabilities
+                            entropy = -(probs * torch.log2(probs)).sum()
+                            entropy_sum += entropy.item()
+                        train_metrics['codes_entropy'] += entropy_sum / codes_flat.shape[1]  # Average across codebooks
+                
                 print(f"DEBUG: Completed batch {update + 1}/{updates_per_epoch} for epoch {epoch + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 print("=" * 50)
@@ -378,6 +435,25 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         'global_step': global_step,
                         'update': update
                     }
+                    
+                    # Add quantization metrics if using quantization
+                    if use_quantization:
+                        log_dict.update({
+                            'train/quantization_penalty': quantization_penalty.item(),
+                            'train/bandwidth_kbps': bandwidth.item(),
+                        })
+                        
+                        # Add codes entropy if available
+                        if codes is not None:
+                            codes_flat = codes.reshape(-1, codes.shape[1])
+                            entropy_sum = 0.0
+                            for q in range(codes_flat.shape[1]):
+                                code_counts = torch.bincount(codes_flat[:, q], minlength=model.quantizer.codebook_size)
+                                probs = code_counts.float() / code_counts.sum()
+                                probs = probs[probs > 0]
+                                entropy = -(probs * torch.log2(probs)).sum()
+                                entropy_sum += entropy.item()
+                            log_dict['train/codes_entropy'] = entropy_sum / codes_flat.shape[1]
                     
                     # Add balancer metrics if available
                     if balancer.metrics:
@@ -410,6 +486,14 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
             'val_total_loss': 0.0
         }
         
+        # Add quantization metrics if using quantization
+        if use_quantization:
+            val_metrics.update({
+                'val_quantization_penalty': 0.0,
+                'val_bandwidth_kbps': 0.0,
+                'val_codes_entropy': 0.0
+            })
+        
         val_batches = 0
         first_batch_audio = None  # Store first batch for audio saving
         first_batch_reconstructed = None
@@ -423,8 +507,20 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 batch = batch.to(device)
                 
                 # Forward pass
-                continuous_embeddings = model.encode(batch)
-                reconstructed_audio = model.decode(continuous_embeddings)
+                if use_quantization:
+                    # For quantized model, use forward() to get QuantizedResult
+                    quantized_result = model(batch)
+                    reconstructed_audio = quantized_result.x
+                    quantization_penalty = quantized_result.penalty
+                    codes = quantized_result.codes
+                    bandwidth = quantized_result.bandwidth
+                else:
+                    # For baseline model, use encode/decode
+                    continuous_embeddings = model.encode(batch)
+                    reconstructed_audio = model.decode(continuous_embeddings)
+                    quantization_penalty = torch.tensor(0.0, device=device)
+                    codes = None
+                    bandwidth = torch.tensor(0.0, device=device)
                 
                 # Ensure same length
                 if reconstructed_audio.shape[-1] > batch.shape[-1]:
@@ -462,6 +558,23 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 val_metrics['val_adversarial_loss'] += adv_loss.item()
                 val_metrics['val_feature_matching_loss'] += feat_loss.item()
                 
+                # Update quantization metrics if using quantization
+                if use_quantization:
+                    val_metrics['val_quantization_penalty'] += quantization_penalty.item()
+                    val_metrics['val_bandwidth_kbps'] += bandwidth.item()
+                    
+                    # Calculate codes entropy (diversity measure)
+                    if codes is not None:
+                        codes_flat = codes.reshape(-1, codes.shape[1])
+                        entropy_sum = 0.0
+                        for q in range(codes_flat.shape[1]):
+                            code_counts = torch.bincount(codes_flat[:, q], minlength=model.quantizer.codebook_size)
+                            probs = code_counts.float() / code_counts.sum()
+                            probs = probs[probs > 0]
+                            entropy = -(probs * torch.log2(probs)).sum()
+                            entropy_sum += entropy.item()
+                        val_metrics['val_codes_entropy'] += entropy_sum / codes_flat.shape[1]
+                
                 # For validation, compute effective loss manually without using balancer.backward
                 # since we don't want to perform actual backward passes during validation
                 balanced_losses = {
@@ -471,12 +584,19 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     'feat_loss': feat_loss
                 }
                 
+                # Note: quantization_penalty (commitment loss) is NOT included in balancer
+                # as per EnCodec paper - it applies only to encoder, not model output
+                
                 # Compute effective loss using the same weights as the balancer
                 total_weights = sum(balancer.weights.values())
                 val_total = torch.tensor(0., device=batch.device, dtype=batch.dtype)
                 for name, loss in balanced_losses.items():
                     weight = balancer.weights.get(name, 0.0)
                     val_total += (weight / total_weights) * loss.detach()
+                
+                # Add commitment loss separately (not in balancer per EnCodec paper)
+                if use_quantization:
+                    val_total = val_total + quantization_penalty.detach()
                 
                 val_metrics['val_total_loss'] += val_total.item()
                 
@@ -541,49 +661,73 @@ def main():
         channels = 32
         batch_size = 4
         config_name = "baseline-32ch-24khz"
+        use_quantization = False
         print("Using 32-channel configuration")
+    elif args.__dict__['1chtoken']:
+        channels = 1
+        batch_size = 1  # Reduced to 1 for testing
+        config_name = "baseline-1chtoken-24khz"
+        use_quantization = True
+        print("Using 1-channel configuration with quantization/tokenization")
     else:  # 1ch
         channels = 1
         batch_size = 32
         config_name = "baseline-1ch-24khz"
+        use_quantization = False
         print("Using 1-channel configuration")
     
     # Setup wandb (will handle login if needed)
     setup_wandb()
     
     # Initialize wandb
+    wandb_config = {
+        "sample_rate": 24000,
+        "channels": channels,
+        "n_filters": 4,
+        "n_residual_layers": 1,
+        "dimension": 32,
+        "causal": False,
+        "epochs": 300,
+        "updates_per_epoch": 2000,
+        "batch_size": batch_size,
+        "learning_rate": 3e-4,
+        "beta1": 0.5,
+        "beta2": 0.9,
+        "segment_duration": 1.0,
+        "use_quantization": use_quantization,
+        "loss_weights": {
+            "time_reconstruction": 0.1,  # λt (time domain)
+            "freq_reconstruction": 1.0,  # λf (frequency domain)
+            "adversarial": 3.0,          # λg (generator)
+            "feature_matching": 3.0      # λfeat (feature matching)
+        },
+        "balancer": {
+            "balance_grads": True,       # Enable gradient balancing
+            "total_norm": 1.0,          # Reference norm for scaling
+            "ema_decay": 0.999,         # EMA decay for gradient norm tracking
+            "per_batch_item": True,     # Compute norms per batch item
+            "epsilon": 1e-12,           # Numerical stability
+            "monitor": True             # Store gradient ratio metrics
+        }
+    }
+    
+    # Add quantization parameters if using quantization
+    if use_quantization:
+        wandb_config["loss_weights"]["quantization_penalty"] = 1.0  # λq (quantization penalty)
+        wandb_config["quantization"] = {
+            "n_q": 2,                    # Number of codebooks
+            "codebook_size": 1024,       # Size of each codebook
+            "commitment_weight": 1.0,    # Weight for commitment loss
+            "decay": 0.99,              # EMA decay for codebook updates
+            "kmeans_init": True,        # Use k-means initialization
+            "kmeans_iters": 50,         # Number of k-means iterations
+            "threshold_ema_dead_code": 2.0  # Threshold for dead code replacement
+        }
+    
     wandb.init(
         project="baseline-autoencoder-training",
         name=config_name,
-        config={
-            "sample_rate": 24000,
-            "channels": channels,
-            "n_filters": 4,
-            "n_residual_layers": 1,
-            "dimension": 32,
-            "causal": False,
-            "epochs": 300,
-            "updates_per_epoch": 2000,
-            "batch_size": batch_size,
-            "learning_rate": 3e-4,
-            "beta1": 0.5,
-            "beta2": 0.9,
-            "segment_duration": 1.0,
-            "loss_weights": {
-                "time_reconstruction": 0.1,  # λt (time domain)
-                "freq_reconstruction": 1.0,  # λf (frequency domain)
-                "adversarial": 3.0,          # λg (generator)
-                "feature_matching": 3.0      # λfeat (feature matching)
-            },
-            "balancer": {
-                "balance_grads": True,       # Enable gradient balancing
-                "total_norm": 1.0,          # Reference norm for scaling
-                "ema_decay": 0.999,         # EMA decay for gradient norm tracking
-                "per_batch_item": True,     # Compute norms per batch item
-                "epsilon": 1e-12,           # Numerical stability
-                "monitor": True             # Store gradient ratio metrics
-            }
-        }
+        config=wandb_config
     )
     
     # Set device
@@ -591,15 +735,29 @@ def main():
     print(f"Using device: {device}")
     
     # Build the model
-    print("Building baseline autoencoder model...")
-    model = build_encodec_model(
-        sample_rate=24000,
-        channels=channels,
-        n_filters=4,
-        n_residual_layers=1,
-        dimension=32,
-        causal=False
-    ).to(device)
+    if use_quantization:
+        print("Building quantized autoencoder model...")
+        model = build_quantized_encodec_model(
+            sample_rate=24000,
+            channels=channels,
+            n_filters=4,
+            n_residual_layers=1,
+            dimension=32,
+            causal=False,
+            n_q=2,  # Number of codebooks
+            codebook_size=1024,  # Size of each codebook
+            commitment_weight=1.0  # Weight for commitment loss
+        ).to(device)
+    else:
+        print("Building baseline autoencoder model...")
+        model = build_encodec_model(
+            sample_rate=24000,
+            channels=channels,
+            n_filters=4,
+            n_residual_layers=1,
+            dimension=32,
+            causal=False
+        ).to(device)
     
     # Build MS-STFT discriminator
     print("Building MS-STFT discriminator...")
@@ -685,8 +843,10 @@ def main():
     # Use different model names for different channel modes
     if channels == 32:
         save_path = Path("bestmodel_32ch.pth")
+    elif use_quantization:  # 1chtoken
+        save_path = Path("bestmodel_1chtoken.pth")
     else:  # 1ch
-        save_path = Path("bestmodel.pth")
+        save_path = Path("bestmodel_1ch.pth")
     
     train_baseline_with_wandb(
         model=model,
@@ -700,7 +860,8 @@ def main():
         save_path=save_path,
         device=device,
         batch_size=batch_size,
-        channels=channels
+        channels=channels,
+        use_quantization=use_quantization
     )
     
     print("Training completed!")
