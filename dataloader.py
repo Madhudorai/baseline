@@ -539,6 +539,331 @@ def _filter_files_by_duration(files: tp.List[Path], min_duration: float, sample_
     return valid_files
 
 
+class TwoBranchAudioDataset(Dataset):
+    """Dataset for 2-branch mode that loads pairs of same channel/segment with different second codebook targets.
+    
+    This dataset is designed for 2-branch quantization where:
+    - First codebook tokens should be the same for both branches (same audio content)
+    - Second codebook tokens should be maximally different between branches
+    """
+    
+    def __init__(self, 
+                 audio_files: tp.List[Path],
+                 sample_rate: int = 24000,
+                 segment_duration: float = 1.0,
+                 channels: int = 1,
+                 min_file_duration: float = None,
+                 random_crop: bool = True,
+                 cache_size: int = 100):
+        """
+        Args:
+            audio_files: List of audio files to use
+            sample_rate: Target sample rate
+            segment_duration: Duration of segments in seconds
+            channels: Number of channels to load
+            min_file_duration: Minimum file duration to include (in seconds)
+            random_crop: Whether to randomly crop longer segments
+            cache_size: Cache size for loaded audio files
+        """
+        self.audio_files = audio_files
+        self.sample_rate = sample_rate
+        self.segment_duration = segment_duration
+        self.channels = channels
+        self.min_file_duration = min_file_duration
+        self.random_crop = random_crop
+        self.cache_size = cache_size
+        self._audio_cache = {}  # Cache for loaded audio files
+        
+        # Pre-generate pairs of segments from the same file/channel
+        self.segment_pairs = self._generate_segment_pairs()
+    
+    def _generate_segment_pairs(self) -> tp.List[tp.Tuple[Path, int, int, int]]:
+        """Pre-generate pairs of segments (file_path, start_sample, channel_idx, pair_id).
+        
+        Returns:
+            List of tuples: (file_path, start_sample, channel_idx, pair_id)
+            where pair_id is 0 or 1 for the two branches
+            Each pair uses DIFFERENT channels from the same file/segment
+        """
+        pairs = []
+        
+        for file_path in self.audio_files:
+            try:
+                info = sf.info(str(file_path))
+                if self.min_file_duration and info.duration < self.min_file_duration:
+                    continue
+                    
+                # Calculate how many segments we can get from this file
+                file_samples = int(info.duration * self.sample_rate)
+                segment_samples = int(self.segment_duration * self.sample_rate)
+                
+                if file_samples < segment_samples:
+                    continue
+                
+                # Load file to get channel count for random selection
+                try:
+                    audio, _ = sf.read(str(file_path), dtype=np.float32)
+                    if len(audio.shape) == 2:
+                        num_channels = audio.shape[1]  # soundfile loads as (samples, channels)
+                    else:
+                        num_channels = 1
+                except:
+                    num_channels = 1
+                
+                # Need at least 2 channels to create different channel pairs
+                if num_channels < 2:
+                    continue
+                
+                # Generate multiple segment pairs from this file
+                max_pairs = min(5, file_samples // segment_samples)  # Max 5 pairs per file
+                for _ in range(max_pairs):
+                    if self.random_crop:
+                        start_sample = random.randint(0, file_samples - segment_samples)
+                    else:
+                        start_sample = 0
+                    
+                    # Select TWO DIFFERENT channels for the pair
+                    available_channels = list(range(num_channels))
+                    channel_1 = random.choice(available_channels)
+                    available_channels.remove(channel_1)
+                    channel_2 = random.choice(available_channels)
+                    
+                    # Create pair: same file, same segment, DIFFERENT channels
+                    pairs.append((file_path, start_sample, channel_1, 0))  # Branch 0 - channel 1
+                    pairs.append((file_path, start_sample, channel_2, 1))  # Branch 1 - channel 2
+                    
+            except Exception as e:
+                print(f"Warning: Could not process {file_path}: {e}")
+                continue
+        
+        return pairs
+    
+    def __len__(self) -> int:
+        return len(self.segment_pairs)
+    
+    def _load_audio_file(self, file_path: Path) -> torch.Tensor:
+        """Load and cache audio file."""
+        file_str = str(file_path)
+        
+        # Check cache first
+        if file_str in self._audio_cache:
+            return self._audio_cache[file_str]
+        
+        # Load audio file
+        try:
+            audio, sr = sf.read(file_str, dtype=np.float32)
+            
+            # (channels, samples)
+            if len(audio.shape) == 1:
+                audio = np.tile(audio, (self.channels, 1))
+            else:
+                audio = audio.T
+            
+            # Fix channel count
+            if audio.shape[0] < self.channels:
+                padding = np.zeros((self.channels - audio.shape[0], audio.shape[1]), dtype=np.float32)
+                audio = np.vstack([audio, padding])
+            elif audio.shape[0] > self.channels:
+                if self.channels == 1:
+                    # For 1-channel mode, randomly pick one of the available channels
+                    random_channel_idx = random.randint(0, audio.shape[0] - 1)
+                    audio = audio[random_channel_idx:random_channel_idx + 1, :]
+                else:
+                    # For multi-channel mode, take the first N channels
+                    audio = audio[:self.channels, :]
+            
+            audio = torch.from_numpy(audio).float()
+            
+            # Resample
+            if sr != self.sample_rate:
+                audio = self._resample(audio, sr, self.sample_rate)
+            
+            # Cache the audio (with LRU eviction if cache is full)
+            if len(self._audio_cache) >= self.cache_size:
+                # Remove oldest entry (simple FIFO)
+                oldest_key = next(iter(self._audio_cache))
+                del self._audio_cache[oldest_key]
+            
+            self._audio_cache[file_str] = audio
+            return audio
+            
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            # Return silence if file can't be loaded
+            target_samples = int(self.segment_duration * self.sample_rate)
+            return torch.zeros(self.channels, target_samples, dtype=torch.float32)
+    
+    def __getitem__(self, index: int) -> torch.Tensor:
+        """Get a segment from a specific branch with the correct channel."""
+        file_path, start_sample, channel_idx, pair_id = self.segment_pairs[index]
+        
+        try:
+            # Use cached loading
+            audio = self._load_audio_file(file_path)
+            
+            # For 1-channel mode, use the pre-generated channel selection
+            # This ensures different channels for different branches
+            if self.channels == 1 and audio.shape[0] > 1:
+                audio = audio[channel_idx:channel_idx + 1, :]
+            
+            # Extract the segment
+            target_samples = int(self.segment_duration * self.sample_rate)
+            current_samples = audio.shape[1]
+            
+            if current_samples < target_samples:
+                # Pad if too short
+                padding = torch.zeros(self.channels, target_samples - current_samples)
+                audio = torch.cat([audio, padding], dim=1)
+            elif current_samples > target_samples:
+                # Crop the segment
+                audio = audio[:, start_sample:start_sample + target_samples]
+            
+            return audio
+            
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            return torch.zeros(self.channels, int(self.segment_duration * self.sample_rate))
+    
+    def _resample(self, audio: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
+        if orig_sr == target_sr:
+            return audio
+        orig_length = audio.shape[1]
+        target_length = int(orig_length * target_sr / orig_sr)
+        audio = audio.unsqueeze(0)
+        audio = F.interpolate(audio, size=target_length, mode='linear', align_corners=False)
+        return audio.squeeze(0)
+
+
+def create_2branch_dataloaders(audio_dir: str,
+                              train_folders: tp.List[str],
+                              val_folders: tp.List[str],
+                              batch_size: int = 2,  # Must be even for pairs
+                              sample_rate: int = 24000,
+                              segment_duration: float = 1.0,
+                              channels: int = 1,
+                              num_workers: int = 4,
+                              train_dataset_size: int = 8000,
+                              val_dataset_size: int = 2000,
+                              min_file_duration: float = None,
+                              **kwargs) -> tp.Tuple[DataLoader, DataLoader]:
+    """Create train and validation DataLoaders for 2-branch mode.
+    
+    Args:
+        audio_dir: Base directory containing audio files
+        train_folders: List of folder names to use for training
+        val_folders: List of folder names to use for validation
+        batch_size: Batch size for training (must be even for pairs)
+        sample_rate: Target sample rate
+        segment_duration: Duration of segments in seconds
+        channels: Number of channels to load
+        num_workers: Number of worker processes
+        train_dataset_size: Number of training samples per epoch
+        val_dataset_size: Number of validation samples per epoch
+        min_file_duration: Minimum file duration to include (in seconds)
+        **kwargs: Additional arguments passed to TwoBranchAudioDataset
+        
+    Returns:
+        Tuple of (train_loader, val_loader)
+    """
+    
+    # Ensure batch size is even for pairs
+    if batch_size % 2 != 0:
+        raise ValueError(f"Batch size must be even for 2-branch mode, got {batch_size}")
+    
+    audio_dir_path = Path(audio_dir)
+    file_extensions = kwargs.get('file_extensions', ['.wav'])
+    file_extensions = [ext.lower() for ext in file_extensions]
+    
+    # Find training files from specified folders
+    train_files = []
+    for folder in train_folders:
+        folder_path = audio_dir_path / folder
+        if folder_path.exists():
+            for ext in file_extensions:
+                train_files.extend(folder_path.glob(f"**/*{ext}"))
+                train_files.extend(folder_path.glob(f"**/*{ext.upper()}"))
+        else:
+            print(f"Warning: Training folder '{folder}' not found in {audio_dir}")
+    
+    # Find validation files from specified folders
+    val_files = []
+    for folder in val_folders:
+        folder_path = audio_dir_path / folder
+        if folder_path.exists():
+            for ext in file_extensions:
+                val_files.extend(folder_path.glob(f"**/*{ext}"))
+                val_files.extend(folder_path.glob(f"**/*{ext.upper()}"))
+        else:
+            print(f"Warning: Validation folder '{folder}' not found in {audio_dir}")
+    
+    train_files = sorted(train_files)
+    val_files = sorted(val_files)
+    
+    if len(train_files) == 0:
+        raise ValueError(f"No training files found in folders: {train_folders}")
+    if len(val_files) == 0:
+        raise ValueError(f"No validation files found in folders: {val_folders}")
+    
+    # Filter files by duration if specified
+    if min_file_duration is not None:
+        train_files = _filter_files_by_duration(train_files, min_file_duration, sample_rate)
+        val_files = _filter_files_by_duration(val_files, min_file_duration, sample_rate)
+        
+        if len(train_files) == 0:
+            raise ValueError(f"No training files longer than {min_file_duration}s found")
+        if len(val_files) == 0:
+            raise ValueError(f"No validation files longer than {min_file_duration}s found")
+    
+    print(f"Found {len(train_files)} training files from folders: {train_folders}")
+    print(f"Found {len(val_files)} validation files from folders: {val_folders}")
+    
+    # Create training dataset
+    dataset_kwargs = {k: v for k, v in kwargs.items() if k not in ['pin_memory', 'num_workers', 'batch_size', 'persistent_workers']}
+    train_dataset = TwoBranchAudioDataset(
+        audio_files=train_files,
+        sample_rate=sample_rate,
+        segment_duration=segment_duration,
+        channels=channels,
+        min_file_duration=min_file_duration,
+        random_crop=kwargs.get('random_crop', True),
+        cache_size=kwargs.get('cache_size', 100)
+    )
+    
+    # Create validation dataset
+    val_dataset = TwoBranchAudioDataset(
+        audio_files=val_files,
+        sample_rate=sample_rate,
+        segment_duration=segment_duration,
+        channels=channels,
+        min_file_duration=min_file_duration,
+        random_crop=kwargs.get('random_crop', True),
+        cache_size=kwargs.get('cache_size', 100)
+    )
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,  # Shuffle training data
+        num_workers=num_workers,
+        pin_memory=kwargs.get('pin_memory', False),
+        persistent_workers=kwargs.get('persistent_workers', False),
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # Don't shuffle validation data for consistent evaluation
+        num_workers=num_workers,
+        pin_memory=kwargs.get('pin_memory', False),
+        persistent_workers=kwargs.get('persistent_workers', False),
+        drop_last=True
+    )
+    
+    return train_loader, val_loader
+
+
 def create_train_test_dataloaders(audio_dir: str,
                                 train_ratio: float = 0.8,
                                 batch_size: int = 4,

@@ -7,11 +7,16 @@ Based on the EnCodec paper: 300 epochs, 2000 updates per epoch, batch size 64.
 import logging
 import wandb
 import torch
+import torch.nn.functional as F
 import argparse
 import time
 import soundfile as sf
 import numpy as np
 from pathlib import Path
+import os
+
+# Set CUDA memory configuration to avoid fragmentation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 from model_builder import build_encodec_model, build_quantized_encodec_model
 from dataloader import create_train_test_dataloaders, create_folder_based_dataloaders
@@ -105,12 +110,13 @@ def save_audio_samples_to_wandb(original_audio, reconstructed_audio, epoch, samp
 
 
 def parse_args():
-    """Parse command line arguments for 32ch vs 1ch vs 1chtoken configuration."""
+    """Parse command line arguments for 32ch vs 1ch vs 1chtoken vs 2branch configuration."""
     parser = argparse.ArgumentParser(description='Baseline autoencoder training')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--32ch', action='store_true', help='Use 32-channel configuration')
     group.add_argument('--1ch', action='store_true', help='Use 1-channel configuration')
     group.add_argument('--1chtoken', action='store_true', help='Use 1-channel configuration with quantization/tokenization')
+    group.add_argument('--2branch', action='store_true', help='Use 2-branch mode with shared first codebook and diverse second codebook')
     return parser.parse_args()
 
 
@@ -170,7 +176,7 @@ def setup_wandb():
 
 def train_baseline_with_wandb(model, discriminator, train_loader, val_loader, 
                             model_optimizer, adversarial_loss,
-                            num_epochs, updates_per_epoch, save_path, device, batch_size, channels, use_quantization=False):
+                            num_epochs, updates_per_epoch, save_path, device, batch_size, channels, use_quantization=False, use_2branch=False):
     """Custom training loop with comprehensive wandb logging for baseline autoencoder."""
     
     from losses import ReconstructionLoss
@@ -223,12 +229,17 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         }
         
         # Add quantization metrics if using quantization
-        if use_quantization:
+        if use_quantization or use_2branch:
             train_metrics.update({
                 'quantization_penalty': 0.0,
                 'bandwidth_kbps': 0.0,
                 'codes_entropy': 0.0
             })
+            if use_2branch:
+                train_metrics.update({
+                    'diversity_loss': 0.0,
+                    'consistency_loss': 0.0
+                })
         
         # Training loop for this epoch
         for update in range(updates_per_epoch):
@@ -256,11 +267,27 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"DEBUG: Starting forward pass for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                if use_quantization:
+                if use_2branch:
+                    # For 2-branch quantized model, use forward() to get TwoBranchQuantizedResult
+                    quantized_result = model(batch)
+                    reconstructed_audio = quantized_result.x
+                    quantization_penalty = quantized_result.penalty
+                    diversity_loss = quantized_result.diversity_loss
+                    consistency_loss = quantized_result.consistency_loss
+                    codes = quantized_result.codes
+                    bandwidth = quantized_result.bandwidth
+                    print(f"DEBUG: 2-Branch quantized batch, reconstructed shape: {reconstructed_audio.shape}")
+                    print(f"DEBUG: Codes shape: {codes.shape}, Penalty: {quantization_penalty.item():.6f}")
+                    print(f"DEBUG: Diversity loss: {diversity_loss.item():.6f}")
+                    print(f"DEBUG: Consistency loss: {consistency_loss.item():.6f}")
+                    print(f"DEBUG: Bandwidth: {bandwidth.item():.6f} kbps")
+                elif use_quantization:
                     # For quantized model, use forward() to get QuantizedResult
                     quantized_result = model(batch)
                     reconstructed_audio = quantized_result.x
                     quantization_penalty = quantized_result.penalty
+                    diversity_loss = torch.tensor(0.0, device=device)
+                    consistency_loss = torch.tensor(0.0, device=device)
                     codes = quantized_result.codes
                     bandwidth = quantized_result.bandwidth
                     print(f"DEBUG: Quantized batch, reconstructed shape: {reconstructed_audio.shape}")
@@ -274,6 +301,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     
                     reconstructed_audio = model.decode(continuous_embeddings)
                     quantization_penalty = torch.tensor(0.0, device=device)
+                    diversity_loss = torch.tensor(0.0, device=device)
+                    consistency_loss = torch.tensor(0.0, device=device)
                     codes = None
                     bandwidth = torch.tensor(0.0, device=device)
                 
@@ -369,10 +398,15 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"DEBUG: Effective loss: {effective_loss.item():.6f}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                # Add commitment loss separately (not in balancer per EnCodec paper)
-                if use_quantization:
+                # Add commitment loss, diversity loss, and consistency loss separately (not in balancer per EnCodec paper)
+                if use_quantization or use_2branch:
                     effective_loss = effective_loss + quantization_penalty
                     print(f"DEBUG: Added commitment loss: {quantization_penalty.item():.6f}")
+                    if use_2branch:
+                        effective_loss = effective_loss + diversity_loss
+                        effective_loss = effective_loss + consistency_loss
+                        print(f"DEBUG: Added diversity loss: {diversity_loss.item():.6f}")
+                        print(f"DEBUG: Added consistency loss: {consistency_loss.item():.6f}")
                     print(f"DEBUG: Total loss with commitment: {effective_loss.item():.6f}")
                 
                 # DEBUG: Print effective loss and balancer metrics
@@ -399,9 +433,13 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 train_metrics['discriminator_loss'] += disc_loss.item()
                 
                 # Update quantization metrics if using quantization
-                if use_quantization:
+                if use_quantization or use_2branch:
                     train_metrics['quantization_penalty'] += quantization_penalty.item()
                     train_metrics['bandwidth_kbps'] += bandwidth.item()
+                    
+                    if use_2branch:
+                        train_metrics['diversity_loss'] += diversity_loss.item()
+                        train_metrics['consistency_loss'] += consistency_loss.item()
                     
                     # Calculate codes entropy (diversity measure)
                     if codes is not None:
@@ -420,14 +458,34 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 print("=" * 50)
                 
-                # Clear memory every 100 batches to prevent memory leaks
-                if (update + 1) % 100 == 0:
+                # Clear memory every 5 batches to prevent memory leaks
+                if (update + 1) % 5 == 0:
                     torch.cuda.empty_cache()
                     if torch.cuda.is_available():
                         memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                         memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
                         print(f"DEBUG: Cleared CUDA cache after batch {update + 1}")
                         print(f"DEBUG: Memory - Allocated: {memory_allocated:.2f} GB, Reserved: {memory_reserved:.2f} GB")
+                
+                # Force garbage collection every 20 batches
+                if (update + 1) % 20 == 0:
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                
+                # Check memory usage and warn if getting close to limit
+                if torch.cuda.is_available():
+                    memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                    memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+                    total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+                    
+                    # Warn if using more than 90% of GPU memory
+                    if memory_allocated / total_memory > 0.9:
+                        print(f"⚠️  WARNING: High GPU memory usage! {memory_allocated:.2f}GB / {total_memory:.2f}GB ({memory_allocated/total_memory*100:.1f}%)")
+                        # Force aggressive cleanup
+                        torch.cuda.empty_cache()
+                        import gc
+                        gc.collect()
                 
                 # Log to wandb every 100 steps
                 if global_step % 100 == 0:
@@ -446,11 +504,15 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     }
                     
                     # Add quantization metrics if using quantization
-                    if use_quantization:
+                    if use_quantization or use_2branch:
                         log_dict.update({
                             'train/quantization_penalty': quantization_penalty.item(),
                             'train/bandwidth_kbps': bandwidth.item(),
                         })
+                        
+                        if use_2branch:
+                            log_dict['train/diversity_loss'] = diversity_loss.item()
+                            log_dict['train/consistency_loss'] = consistency_loss.item()
                         
                         # Add codes entropy if available
                         if codes is not None:
@@ -473,6 +535,18 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                                    
                 global_step += 1
                 
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"❌ CUDA OOM Error at batch {update + 1}: {e}")
+                print("🔄 Attempting recovery...")
+                
+                # Clear all caches
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                
+                # Try to continue with next batch
+                print("⚠️  Skipping this batch due to OOM")
+                continue
             except Exception as e:
                 logger.error(f"Error in training step: {e}")
                 continue
@@ -496,16 +570,29 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         }
         
         # Add quantization metrics if using quantization
-        if use_quantization:
+        if use_quantization or use_2branch:
             val_metrics.update({
                 'val_quantization_penalty': 0.0,
                 'val_bandwidth_kbps': 0.0,
                 'val_codes_entropy': 0.0
             })
+            if use_2branch:
+                val_metrics.update({
+                    'val_diversity_loss': 0.0,
+                    'val_consistency_loss': 0.0
+                })
         
         val_batches = 0
         first_batch_audio = None  # Store first batch for audio saving
         first_batch_reconstructed = None
+        
+        # Validation metrics for different audio consistency check
+        different_audio_consistency = 0.0  # Should be HIGH (different first codebook tokens)
+        different_audio_samples = 0
+        
+        # Store fixed different audio samples for consistent validation across epochs
+        if not hasattr(train_baseline_with_wandb, 'fixed_different_audio_samples'):
+            train_baseline_with_wandb.fixed_different_audio_samples = None
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
@@ -516,11 +603,22 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 batch = batch.to(device)
                 
                 # Forward pass
-                if use_quantization:
+                if use_2branch:
+                    # For 2-branch quantized model, use forward() to get TwoBranchQuantizedResult
+                    quantized_result = model(batch)
+                    reconstructed_audio = quantized_result.x
+                    quantization_penalty = quantized_result.penalty
+                    diversity_loss = quantized_result.diversity_loss
+                    consistency_loss = quantized_result.consistency_loss
+                    codes = quantized_result.codes
+                    bandwidth = quantized_result.bandwidth
+                elif use_quantization:
                     # For quantized model, use forward() to get QuantizedResult
                     quantized_result = model(batch)
                     reconstructed_audio = quantized_result.x
                     quantization_penalty = quantized_result.penalty
+                    diversity_loss = torch.tensor(0.0, device=device)
+                    consistency_loss = torch.tensor(0.0, device=device)
                     codes = quantized_result.codes
                     bandwidth = quantized_result.bandwidth
                 else:
@@ -528,6 +626,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     continuous_embeddings = model.encode(batch)
                     reconstructed_audio = model.decode(continuous_embeddings)
                     quantization_penalty = torch.tensor(0.0, device=device)
+                    diversity_loss = torch.tensor(0.0, device=device)
+                    consistency_loss = torch.tensor(0.0, device=device)
                     codes = None
                     bandwidth = torch.tensor(0.0, device=device)
                 
@@ -568,9 +668,13 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 val_metrics['val_feature_matching_loss'] += feat_loss.item()
                 
                 # Update quantization metrics if using quantization
-                if use_quantization:
+                if use_quantization or use_2branch:
                     val_metrics['val_quantization_penalty'] += quantization_penalty.item()
                     val_metrics['val_bandwidth_kbps'] += bandwidth.item()
+                    
+                    if use_2branch:
+                        val_metrics['val_diversity_loss'] += diversity_loss.item()
+                        val_metrics['val_consistency_loss'] += consistency_loss.item()
                     
                     # Calculate codes entropy (diversity measure)
                     if codes is not None:
@@ -603,18 +707,112 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     weight = balancer.weights.get(name, 0.0)
                     val_total += (weight / total_weights) * loss.detach()
                 
-                # Add commitment loss separately (not in balancer per EnCodec paper)
-                if use_quantization:
+                # Add commitment loss, diversity loss, and consistency loss separately (not in balancer per EnCodec paper)
+                if use_quantization or use_2branch:
                     val_total = val_total + quantization_penalty.detach()
+                    if use_2branch:
+                        val_total = val_total + diversity_loss.detach()
+                        val_total = val_total + consistency_loss.detach()
                 
                 val_metrics['val_total_loss'] += val_total.item()
                 
                 val_batches += 1
+                
+                # Additional validation: Test different audio samples (same channel, different audio)
+                if use_2branch and batch_idx == 0:  # Only process first batch to find different samples
+                    # Find and store different audio samples for consistent validation across epochs
+                    if train_baseline_with_wandb.fixed_different_audio_samples is None:
+                        print("DEBUG: Finding different audio samples for validation...")
+                        different_samples_found = False
+                        
+                        # Try to find different audio samples by comparing with next few batches
+                        for next_batch_idx in range(1, min(10, len(val_loader))):
+                            try:
+                                next_batch = val_loader.dataset[next_batch_idx * batch_size:(next_batch_idx + 1) * batch_size]
+                                if len(next_batch) == batch_size:
+                                    next_batch = next_batch.to(device)
+                                    
+                                    # Check if inputs are actually different (different volumes, different sounds)
+                                    current_audio_flat = batch.view(batch.shape[0], -1)
+                                    next_audio_flat = next_batch.view(next_batch.shape[0], -1)
+                                    
+                                    # Normalize for cosine similarity
+                                    current_audio_norm = F.normalize(current_audio_flat, p=2, dim=1)
+                                    next_audio_norm = F.normalize(next_audio_flat, p=2, dim=1)
+                                    
+                                    # Audio similarity (we want this to be LOW for different audio)
+                                    audio_similarity = (current_audio_norm * next_audio_norm).sum(dim=1).mean()
+                                    
+                                    # Check if audio samples are different enough (similarity < 0.8)
+                                    if audio_similarity.item() < 0.8:
+                                        # Store the different audio samples for future epochs
+                                        train_baseline_with_wandb.fixed_different_audio_samples = {
+                                            'sample_1': batch.clone().detach(),
+                                            'sample_2': next_batch.clone().detach(),
+                                            'audio_similarity': audio_similarity.item()
+                                        }
+                                        different_samples_found = True
+                                        print(f"DEBUG: Found different audio samples with similarity: {audio_similarity.item():.4f}")
+                                        break
+                                    else:
+                                        print(f"DEBUG: Batch {next_batch_idx} too similar: {audio_similarity.item():.4f}")
+                            except Exception as e:
+                                print(f"DEBUG: Error checking batch {next_batch_idx}: {e}")
+                                continue
+                        
+                        if not different_samples_found:
+                            print("DEBUG: Warning - Could not find sufficiently different audio samples for validation")
+                    
+                    # Use the fixed different audio samples for validation
+                    if train_baseline_with_wandb.fixed_different_audio_samples is not None:
+                        fixed_samples = train_baseline_with_wandb.fixed_different_audio_samples
+                        sample_1 = fixed_samples['sample_1'].to(device)
+                        sample_2 = fixed_samples['sample_2'].to(device)
+                        
+                        # Process both samples
+                        result_1 = model(sample_1)
+                        result_2 = model(sample_2)
+                        
+                        codes_1 = result_1.codes
+                        codes_2 = result_2.codes
+                        
+                        # Reshape to pairs: [B//2, 2, n_q, T]
+                        codes_1_pairs = codes_1.view(codes_1.shape[0] // 2, 2, codes_1.shape[1], -1)
+                        codes_2_pairs = codes_2.view(codes_2.shape[0] // 2, 2, codes_2.shape[1], -1)
+                        
+                        # Test: Different audio should have different first codebook tokens
+                        # Compare first codebook tokens between different audio samples
+                        first_codebook_1 = codes_1_pairs[:, 0, 0, :]  # [B//2, T] - first codebook, first sample
+                        first_codebook_2 = codes_2_pairs[:, 0, 0, :]  # [B//2, T] - first codebook, second sample
+                        
+                        # Calculate similarity (we want this to be LOW for different audio)
+                        first_flat_1 = first_codebook_1.float().view(first_codebook_1.shape[0], -1)
+                        first_flat_2 = first_codebook_2.float().view(first_codebook_2.shape[0], -1)
+                        
+                        # Normalize for cosine similarity
+                        first_norm_1 = F.normalize(first_flat_1, p=2, dim=1)
+                        first_norm_2 = F.normalize(first_flat_2, p=2, dim=1)
+                        
+                        # Cosine similarity (we want this to be LOW for different audio)
+                        different_audio_sim = (first_norm_1 * first_norm_2).sum(dim=1).mean()
+                        
+                        # Different audio consistency: 1 - similarity (higher = more different)
+                        different_audio_consistency += (1.0 - different_audio_sim.item())
+                        different_audio_samples += 1
+                        
+                        # Debug: Print audio similarity to verify we're comparing different audio
+                        print(f"DEBUG: Using fixed different audio samples with similarity: {fixed_samples['audio_similarity']:.4f}")
+                        print(f"DEBUG: First codebook similarity: {different_audio_sim.item():.4f} (should be LOW for different audio)")
         
         # Average validation metrics
         if val_batches > 0:
             for key in val_metrics:
                 val_metrics[key] /= val_batches
+                
+        # Average different audio metrics
+        if different_audio_samples > 0:
+            different_audio_consistency /= different_audio_samples
+            val_metrics['val_different_audio_consistency'] = different_audio_consistency
         
         # Save audio samples every 10 epochs
         if (epoch + 1) % 10 == 0 and first_batch_audio is not None and first_batch_reconstructed is not None:
@@ -658,6 +856,13 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                    f"Feat: {train_metrics['feature_matching_loss']:.6f}")
         print(f"  Val - Total: {val_metrics['val_total_loss']:.6f}")
         
+        # Log 2-branch specific metrics
+        if use_2branch:
+            print(f"  2-Branch Metrics:")
+            print(f"    Consistency Loss: {val_metrics.get('val_consistency_loss', 0.0):.6f} (should decrease)")
+            print(f"    Diversity Loss: {val_metrics.get('val_diversity_loss', 0.0):.6f} (should decrease)")
+            print(f"    Different Audio Consistency: {val_metrics.get('val_different_audio_consistency', 0.0):.6f} (should be HIGH)")
+        
         # Clear memory after each epoch to prevent memory leaks
         torch.cuda.empty_cache()
         print(f"DEBUG: Cleared CUDA cache after epoch {epoch + 1}")
@@ -675,18 +880,28 @@ def main():
         batch_size = 4
         config_name = "baseline-32ch-24khz"
         use_quantization = False
+        use_2branch = False
         print("Using 32-channel configuration")
     elif args.__dict__['1chtoken']:
         channels = 1
         batch_size = 1  # Reduced to 1 for testing
         config_name = "baseline-1chtoken-24khz"
         use_quantization = True
+        use_2branch = False
         print("Using 1-channel configuration with quantization/tokenization")
+    elif args.__dict__['2branch']:
+        channels = 1
+        batch_size = 2  # Need pairs for 2-branch mode
+        config_name = "baseline-2branch-24khz"
+        use_quantization = True
+        use_2branch = True
+        print("Using 2-branch mode with shared first codebook and diverse second codebook")
     else:  # 1ch
         channels = 1
         batch_size = 32
         config_name = "baseline-1ch-24khz"
         use_quantization = False
+        use_2branch = False
         print("Using 1-channel configuration")
     
     # Setup wandb (will handle login if needed)
@@ -725,7 +940,7 @@ def main():
     }
     
     # Add quantization parameters if using quantization
-    if use_quantization:
+    if use_quantization or use_2branch:
         wandb_config["loss_weights"]["quantization_penalty"] = 1.0  # λq (quantization penalty)
         wandb_config["quantization"] = {
             "n_q": 2,                    # Number of codebooks
@@ -736,6 +951,10 @@ def main():
             "kmeans_iters": 50,         # Number of k-means iterations
             "threshold_ema_dead_code": 2.0  # Threshold for dead code replacement
         }
+        if use_2branch:
+            wandb_config["loss_weights"]["diversity_loss"] = 1.0  # λd (diversity loss)
+            wandb_config["loss_weights"]["consistency_loss"] = 1.0  # λc (consistency loss)
+            wandb_config["quantization"]["diversity_weight"] = 1.0  # Weight for diversity loss
     
     wandb.init(
         project="baseline-autoencoder-training",
@@ -748,7 +967,21 @@ def main():
     print(f"Using device: {device}")
     
     # Build the model
-    if use_quantization:
+    if use_2branch:
+        print("Building 2-branch quantized autoencoder model...")
+        from model_builder import build_2branch_quantized_encodec_model
+        model = build_2branch_quantized_encodec_model(
+            sample_rate=24000,
+            channels=channels,
+            n_filters=4,
+            n_residual_layers=1,
+            dimension=32,
+            causal=False,
+            n_q=2,  # Number of codebooks
+            codebook_size=1024,  # Size of each codebook
+            commitment_weight=1.0  # Weight for commitment loss
+        ).to(device)
+    elif use_quantization:
         print("Building quantized autoencoder model...")
         model = build_quantized_encodec_model(
             sample_rate=24000,
@@ -818,22 +1051,41 @@ def main():
     val_folders = ["Woodland", "Train Station"]
     
     # Create folder-based dataloaders with dynamic configuration
-    train_loader, val_loader = create_folder_based_dataloaders(
-        audio_dir="/scratch/eigenscape/",
-        train_folders=train_folders,
-        val_folders=val_folders,
-        batch_size=batch_size,           
-        sample_rate=24000,
-        segment_duration=1.0,    # 1 second segments
-        channels=channels,
-        train_dataset_size=8000,  # 2000 updates × batch_size = 8000 samples per epoch
-        val_dataset_size=2000,    # 2000 validation samples (fixed each epoch)
-        min_file_duration=1.0,    
-        random_crop=True,
-        num_workers=4,  # Enable multiprocessing for faster data loading
-        pin_memory=True,  # Enable pinned memory for faster GPU transfer
-        persistent_workers=True  # Keep workers alive between epochs
-    )
+    if use_2branch:
+        from dataloader import create_2branch_dataloaders
+        train_loader, val_loader = create_2branch_dataloaders(
+            audio_dir="/scratch/eigenscape/",
+            train_folders=train_folders,
+            val_folders=val_folders,
+            batch_size=batch_size,           
+            sample_rate=24000,
+            segment_duration=1.0,    # 1 second segments
+            channels=channels,
+            train_dataset_size=8000,  # 2000 updates × batch_size = 8000 samples per epoch
+            val_dataset_size=2000,    # 2000 validation samples (fixed each epoch)
+            min_file_duration=1.0,    
+            random_crop=True,
+            num_workers=4,  # Enable multiprocessing for faster data loading
+            pin_memory=True,  # Enable pinned memory for faster GPU transfer
+            persistent_workers=True  # Keep workers alive between epochs
+        )
+    else:
+        train_loader, val_loader = create_folder_based_dataloaders(
+            audio_dir="/scratch/eigenscape/",
+            train_folders=train_folders,
+            val_folders=val_folders,
+            batch_size=batch_size,           
+            sample_rate=24000,
+            segment_duration=1.0,    # 1 second segments
+            channels=channels,
+            train_dataset_size=8000,  # 2000 updates × batch_size = 8000 samples per epoch
+            val_dataset_size=2000,    # 2000 validation samples (fixed each epoch)
+            min_file_duration=1.0,    
+            random_crop=True,
+            num_workers=4,  # Enable multiprocessing for faster data loading
+            pin_memory=True,  # Enable pinned memory for faster GPU transfer
+            persistent_workers=True  # Keep workers alive between epochs
+        )
     
     # Log dataset information
     print(f"Training dataset size: {len(train_loader.dataset)} samples")
@@ -856,6 +1108,8 @@ def main():
     # Use different model names for different channel modes
     if channels == 32:
         save_path = Path("bestmodel_32ch.pth")
+    elif use_2branch:  # 2branch
+        save_path = Path("bestmodel_2branch.pth")
     elif use_quantization:  # 1chtoken
         save_path = Path("bestmodel_1chtoken.pth")
     else:  # 1ch
@@ -874,7 +1128,8 @@ def main():
         device=device,
         batch_size=batch_size,
         channels=channels,
-        use_quantization=use_quantization
+        use_quantization=use_quantization,
+        use_2branch=use_2branch
     )
     
     print("Training completed!")
