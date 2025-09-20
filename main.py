@@ -420,6 +420,15 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 print("=" * 50)
                 
+                # Clear memory every 100 batches to prevent memory leaks
+                if (update + 1) % 100 == 0:
+                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                        memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+                        print(f"DEBUG: Cleared CUDA cache after batch {update + 1}")
+                        print(f"DEBUG: Memory - Allocated: {memory_allocated:.2f} GB, Reserved: {memory_reserved:.2f} GB")
+                
                 # Log to wandb every 100 steps
                 if global_step % 100 == 0:
                     log_dict = {
@@ -648,6 +657,10 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                    f"Adv: {train_metrics['adversarial_loss']:.6f}, "
                    f"Feat: {train_metrics['feature_matching_loss']:.6f}")
         print(f"  Val - Total: {val_metrics['val_total_loss']:.6f}")
+        
+        # Clear memory after each epoch to prevent memory leaks
+        torch.cuda.empty_cache()
+        print(f"DEBUG: Cleared CUDA cache after epoch {epoch + 1}")
 
 
 def main():
