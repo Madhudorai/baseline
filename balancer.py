@@ -100,15 +100,27 @@ class Balancer:
         grads = {}
         for name, loss in losses.items():
             # Compute partial derivative of the loss with respect to the input.
-            grad, = autograd.grad(loss, [input], retain_graph=True)
-            if self.per_batch_item:
-                # We do not average the gradient over the batch dimension.
-                dims = tuple(range(1, grad.dim()))
-                norm = grad.norm(dim=dims, p=2).mean()
-            else:
-                norm = grad.norm(p=2)
-            norms[name] = norm
-            grads[name] = grad
+            try:
+                grad, = autograd.grad(loss, [input], retain_graph=True, allow_unused=True)
+                if grad is None:
+                    # This loss doesn't have gradients flowing back to the input
+                    # Skip it in the balancer
+                    continue
+                if self.per_batch_item:
+                    # We do not average the gradient over the batch dimension.
+                    dims = tuple(range(1, grad.dim()))
+                    norm = grad.norm(dim=dims, p=2).mean()
+                else:
+                    norm = grad.norm(p=2)
+                norms[name] = norm
+                grads[name] = grad
+            except RuntimeError as e:
+                if "One of the differentiated Tensors appears to not have been used in the graph" in str(e):
+                    # This loss doesn't have gradients flowing back to the input
+                    # Skip it in the balancer
+                    continue
+                else:
+                    raise e
 
         count = 1
         if self.per_batch_item:

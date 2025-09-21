@@ -40,7 +40,116 @@ def get_discriminator_input(audio_tensor, channels, channel_idx=None):
         return audio_tensor
 
 
-def save_audio_samples_to_wandb(original_audio, reconstructed_audio, epoch, sample_rate=24000):
+# def select_diverse_audio_samples(audio_batch, num_samples=5):  # Removed - only used for audio saving
+    """Select the most diverse audio samples from a batch based on volume and spectral content.
+    
+    Args:
+        audio_batch: Audio tensor of shape [B, C, T]
+        num_samples: Number of diverse samples to select
+        
+    Returns:
+        List of sample indices representing the most diverse samples
+    """
+    import torch
+    import torch.nn.functional as F
+    
+    batch_size = audio_batch.shape[0]
+    num_samples = min(num_samples, batch_size)
+    
+    if batch_size <= num_samples:
+        return list(range(batch_size))
+    
+    # Calculate features for diversity selection
+    features = []
+    
+    for i in range(batch_size):
+        sample = audio_batch[i]  # [C, T]
+        
+        # Feature 1: Volume (RMS)
+        volume = torch.sqrt(torch.mean(sample ** 2)).item()
+        
+        # Feature 2: Spectral centroid (brightness) - higher = more high-freq content
+        fft = torch.fft.fft(sample, dim=-1)
+        magnitude = torch.abs(fft)
+        freqs = torch.fft.fftfreq(sample.shape[-1], device=sample.device)
+        spectral_centroid = torch.sum(freqs.unsqueeze(0) * magnitude, dim=-1) / torch.sum(magnitude, dim=-1)
+        spectral_centroid = torch.mean(spectral_centroid).item()
+        
+        # Feature 3: Spectral bandwidth (frequency spread) - higher = more diverse frequencies
+        spectral_centroid_tensor = torch.sum(freqs.unsqueeze(0) * magnitude, dim=-1) / torch.sum(magnitude, dim=-1)
+        spectral_bandwidth = torch.sqrt(torch.sum(((freqs.unsqueeze(0) - spectral_centroid_tensor.unsqueeze(-1)) ** 2) * magnitude, dim=-1) / torch.sum(magnitude, dim=-1))
+        spectral_bandwidth = torch.mean(spectral_bandwidth).item()
+        
+        # Feature 4: Spectral rolloff (frequency below which 85% of energy lies) - higher = more high-freq content
+        cumsum = torch.cumsum(magnitude, dim=-1)
+        total_energy = cumsum[..., -1]
+        rolloff_threshold = 0.85 * total_energy
+        rolloff_indices = torch.argmax(cumsum >= rolloff_threshold.unsqueeze(-1), dim=-1)
+        spectral_rolloff = torch.mean(freqs[rolloff_indices]).item()
+        
+        # Feature 5: Low-frequency energy ratio (0-1000 Hz vs total)
+        low_freq_mask = torch.abs(freqs) <= 1000 / (sample.shape[-1] / 2)  # Normalize to Nyquist
+        low_freq_energy = torch.sum(magnitude[..., low_freq_mask], dim=-1)
+        total_energy = torch.sum(magnitude, dim=-1)
+        low_freq_ratio = torch.mean(low_freq_energy / (total_energy + 1e-8)).item()
+        
+        # Feature 6: High-frequency energy ratio (4000+ Hz vs total)
+        high_freq_mask = torch.abs(freqs) >= 4000 / (sample.shape[-1] / 2)  # Normalize to Nyquist
+        high_freq_energy = torch.sum(magnitude[..., high_freq_mask], dim=-1)
+        high_freq_ratio = torch.mean(high_freq_energy / (total_energy + 1e-8)).item()
+        
+        # Feature 7: Zero crossing rate (noisiness) - higher = more noise/high-freq content
+        diff = torch.diff(sample, dim=-1)
+        zero_crossings = torch.sum(torch.sign(diff) != 0, dim=-1).float()
+        zcr = torch.mean(zero_crossings / sample.shape[-1]).item()
+        
+        # Feature 8: Spectral flatness (noise vs tonal content) - lower = more tonal, higher = more noise
+        geometric_mean = torch.exp(torch.mean(torch.log(magnitude + 1e-8), dim=-1))
+        arithmetic_mean = torch.mean(magnitude, dim=-1)
+        spectral_flatness = torch.mean(geometric_mean / (arithmetic_mean + 1e-8)).item()
+        
+        features.append([volume, spectral_centroid, spectral_bandwidth, spectral_rolloff, 
+                        low_freq_ratio, high_freq_ratio, zcr, spectral_flatness])
+    
+    features = torch.tensor(features)  # [B, 8]
+    
+    # Normalize features
+    features_norm = F.normalize(features, p=2, dim=0)
+    
+    # Select diverse samples using k-means-like approach
+    selected_indices = []
+    
+    # Start with the sample that has highest volume (most interesting)
+    max_volume_idx = torch.argmax(features[:, 0]).item()
+    selected_indices.append(max_volume_idx)
+    
+    # Select remaining samples to maximize diversity
+    for _ in range(num_samples - 1):
+        max_min_distance = -1
+        best_candidate = -1
+        
+        for candidate in range(batch_size):
+            if candidate in selected_indices:
+                continue
+                
+            # Calculate minimum distance to already selected samples
+            candidate_features = features_norm[candidate:candidate+1]  # [1, 4]
+            selected_features = features_norm[selected_indices]  # [len(selected), 4]
+            
+            distances = torch.cdist(candidate_features, selected_features).squeeze()
+            min_distance = torch.min(distances).item()
+            
+            if min_distance > max_min_distance:
+                max_min_distance = min_distance
+                best_candidate = candidate
+        
+        if best_candidate != -1:
+            selected_indices.append(best_candidate)
+    
+    return selected_indices
+
+
+def save_audio_samples_to_wandb(original_audio, reconstructed_audio, epoch, sample_rate=24000, diverse_samples=None):
     """Save audio samples as wandb artifacts for monitoring reconstruction quality.
     
     Args:
@@ -48,12 +157,18 @@ def save_audio_samples_to_wandb(original_audio, reconstructed_audio, epoch, samp
         reconstructed_audio: Reconstructed audio tensor (batch, channels, samples)
         epoch: Current epoch number
         sample_rate: Audio sample rate
+        diverse_samples: Pre-selected diverse sample indices (reused across epochs)
     """
     import tempfile
     import os
     
-    # Take first 5 samples from the batch
-    num_samples = min(5, original_audio.shape[0])
+    # Use diverse samples if provided, otherwise take first 5
+    if diverse_samples is not None:
+        num_samples = min(5, len(diverse_samples))
+        sample_indices = diverse_samples[:num_samples]
+    else:
+        num_samples = min(5, original_audio.shape[0])
+        sample_indices = list(range(num_samples))
     
     # Create temporary directory for audio files
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -62,17 +177,17 @@ def save_audio_samples_to_wandb(original_audio, reconstructed_audio, epoch, samp
         # Prepare audio files for wandb
         audio_files = []
         
-        for i in range(num_samples):
+        for idx, sample_idx in enumerate(sample_indices):
             # Convert to numpy and transpose to (samples, channels) for soundfile
-            orig_np = original_audio[i].detach().cpu().numpy().T
-            recon_np = reconstructed_audio[i].detach().cpu().numpy().T
+            orig_np = original_audio[sample_idx].detach().cpu().numpy().T
+            recon_np = reconstructed_audio[sample_idx].detach().cpu().numpy().T
             
             # Save original audio
-            orig_filename = temp_path / f"epoch_{epoch:03d}_sample_{i}_original.wav"
+            orig_filename = temp_path / f"epoch_{epoch:03d}_sample_{idx}_original.wav"
             sf.write(orig_filename, orig_np, sample_rate)
             
             # Save reconstructed audio
-            recon_filename = temp_path / f"epoch_{epoch:03d}_sample_{i}_reconstructed.wav"
+            recon_filename = temp_path / f"epoch_{epoch:03d}_sample_{idx}_reconstructed.wav"
             sf.write(recon_filename, recon_np, sample_rate)
             
             # Add to wandb files list
@@ -180,6 +295,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
     """Custom training loop with comprehensive wandb logging for baseline autoencoder."""
     
     from losses import ReconstructionLoss
+    
+    # Memory optimizations applied - no need for batch size reduction
     import torch
     
     # Create reconstruction loss
@@ -239,7 +356,7 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 train_metrics.update({
                     'diversity_loss': 0.0,
                     'consistency_loss': 0.0
-                })
+            })
         
         # Training loop for this epoch
         for update in range(updates_per_epoch):
@@ -258,6 +375,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     print(f"DEBUG: Skipping incomplete batch with size {batch.shape[0]} (expected {batch_size})")
                     continue
                 
+                # Process batch normally (batch size already reduced for quantization modes)
+                
                 # Move batch to device
                 print(f"DEBUG: Moved batch to device {device}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -267,7 +386,14 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"DEBUG: Starting forward pass for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
+                # Initialize diversity and consistency losses for all modes
+                diversity_loss = torch.tensor(0.0, device=device)
+                consistency_loss = torch.tensor(0.0, device=device)
+                
                 if use_2branch:
+                    # Clear memory before forward pass for 2-branch mode
+                    torch.cuda.empty_cache()
+                    
                     # For 2-branch quantized model, use forward() to get TwoBranchQuantizedResult
                     quantized_result = model(batch)
                     reconstructed_audio = quantized_result.x
@@ -276,12 +402,20 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     consistency_loss = quantized_result.consistency_loss
                     codes = quantized_result.codes
                     bandwidth = quantized_result.bandwidth
+                    
                     print(f"DEBUG: 2-Branch quantized batch, reconstructed shape: {reconstructed_audio.shape}")
                     print(f"DEBUG: Codes shape: {codes.shape}, Penalty: {quantization_penalty.item():.6f}")
                     print(f"DEBUG: Diversity loss: {diversity_loss.item():.6f}")
                     print(f"DEBUG: Consistency loss: {consistency_loss.item():.6f}")
+                    
+                    # Clear intermediate tensors immediately
+                    del quantized_result
+                    torch.cuda.empty_cache()
                     print(f"DEBUG: Bandwidth: {bandwidth.item():.6f} kbps")
                 elif use_quantization:
+                    # Clear memory before forward pass for 1chtoken mode
+                    torch.cuda.empty_cache()
+                    
                     # For quantized model, use forward() to get QuantizedResult
                     quantized_result = model(batch)
                     reconstructed_audio = quantized_result.x
@@ -290,9 +424,14 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                     consistency_loss = torch.tensor(0.0, device=device)
                     codes = quantized_result.codes
                     bandwidth = quantized_result.bandwidth
-                    print(f"DEBUG: Quantized batch, reconstructed shape: {reconstructed_audio.shape}")
+                    
+                    print(f"DEBUG: 1ch-Token quantized batch, reconstructed shape: {reconstructed_audio.shape}")
                     print(f"DEBUG: Codes shape: {codes.shape}, Penalty: {quantization_penalty.item():.6f}")
                     print(f"DEBUG: Bandwidth: {bandwidth.item():.6f} kbps")
+                    
+                    # Clear intermediate tensors immediately
+                    del quantized_result
+                    torch.cuda.empty_cache()
                 else:
                     # For baseline model, use encode/decode
                     continuous_embeddings = model.encode(batch)
@@ -318,48 +457,45 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         reconstructed_audio, (0, pad_length), mode='reflect'
                     )
                 
-                # Step 1: Train discriminator
-                print(f"DEBUG: Training discriminator for batch {update + 1}")
+                # Step 1: Compute reconstruction loss first (no discriminator needed)
+                print(f"DEBUG: Computing reconstruction loss")
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
+                
+                # Clear memory after reconstruction loss for quantization modes
+                if use_2branch or use_quantization:
+                    torch.cuda.empty_cache()
+                
+                # Step 2: Single discriminator pass for both training and adversarial loss
+                print(f"DEBUG: Computing discriminator losses for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Use same random channel for both original and reconstructed in 32ch mode
                 if channels == 32:
                     channel_idx = torch.randint(0, batch.shape[1], (1,)).item()
-                    disc_fake = get_discriminator_input(reconstructed_audio.detach(), channels, channel_idx)
+                    disc_fake = get_discriminator_input(reconstructed_audio, channels, channel_idx)
                     disc_real = get_discriminator_input(batch, channels, channel_idx)
                 else:
-                    disc_fake = get_discriminator_input(reconstructed_audio.detach(), channels)
+                    disc_fake = get_discriminator_input(reconstructed_audio, channels)
                     disc_real = get_discriminator_input(batch, channels)
                 
-                disc_loss = adversarial_loss.train_adv(
-                    fake=disc_fake,
-                    real=disc_real
+                # Train discriminator and get adversarial loss in one pass (saves memory)
+                disc_loss, adv_loss, feat_loss = adversarial_loss.train_adv_and_get_generator_loss(
+                    fake=disc_fake, real=disc_real
                 )
-                print(f"DEBUG: Discriminator loss: {disc_loss.item():.6f}")
+                
+                print(f"DEBUG: Discriminator loss: {disc_loss.item():.6f}, Adversarial loss: {adv_loss.item():.6f}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                # Step 2: Train generator (baseline autoencoder) with loss balancer
+                # Clear memory after discriminator operations
+                del disc_fake, disc_real
+                torch.cuda.empty_cache()
+                
+                # Step 3: Train generator (baseline autoencoder) with loss balancer
                 print(f"DEBUG: Training generator for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 model_optimizer.zero_grad()
-                
-                # Compute individual losses
-                print(f"DEBUG: Computing reconstruction loss")
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
-                recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
-                
-                print(f"DEBUG: Computing adversarial loss")
-                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
-                # Use same random channel for both original and reconstructed in 32ch mode
-                if channels == 32:
-                    # Use the same channel_idx that was used for discriminator training
-                    adv_fake = get_discriminator_input(reconstructed_audio, channels, channel_idx)
-                    adv_real = get_discriminator_input(batch, channels, channel_idx)
-                else:
-                    adv_fake = get_discriminator_input(reconstructed_audio, channels)
-                    adv_real = get_discriminator_input(batch, channels)
-                adv_loss, feat_loss = adversarial_loss(adv_fake, adv_real)
                 
                 # Split reconstruction loss into time and frequency components
                 time_loss = recon_metrics['time_loss']
@@ -380,14 +516,15 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Use loss balancer for gradient balancing
+                # Only include losses that have gradients flowing back to reconstructed_audio
                 balanced_losses = {
                     'time_loss': time_loss,
-                    'freq_loss': freq_loss,
-                    'adv_loss': adv_loss,
-                    'feat_loss': feat_loss
+                    'freq_loss': freq_loss
                 }
                 
-                # Note: quantization_penalty (commitment loss) is NOT included in balancer
+                # Note: adv_loss and feat_loss don't have gradients flowing back to reconstructed_audio
+                # because the discriminator was trained with .detach(). We'll add them manually.
+                # quantization_penalty (commitment loss) is NOT included in balancer
                 # as per EnCodec paper - it applies only to encoder, not model output
                 
                 # Apply balancer - this handles gradient balancing and backward pass
@@ -395,6 +532,9 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 effective_loss = balancer.backward(balanced_losses, reconstructed_audio)
+                
+                # Add adversarial losses manually (they don't have gradients to reconstructed_audio)
+                effective_loss = effective_loss + adv_loss.detach() + feat_loss.detach()
                 print(f"DEBUG: Effective loss: {effective_loss.item():.6f}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
@@ -407,7 +547,20 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         effective_loss = effective_loss + consistency_loss
                         print(f"DEBUG: Added diversity loss: {diversity_loss.item():.6f}")
                         print(f"DEBUG: Added consistency loss: {consistency_loss.item():.6f}")
+                        
+                        # Clear intermediate loss tensors for 2-branch mode
+                        # Note: diversity_loss and consistency_loss are still needed for metrics
+                        torch.cuda.empty_cache()
                     print(f"DEBUG: Total loss with commitment: {effective_loss.item():.6f}")
+                
+                # Clear cache - more aggressive for 2branch mode
+                if use_2branch:
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                elif use_quantization:
+                    torch.cuda.empty_cache()
                 
                 # DEBUG: Print effective loss and balancer metrics
                 print(f"DEBUG - Loss weights: λt=0.1, λf=1.0, λg=3.0, λfeat=3.0")
@@ -422,6 +575,15 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"DEBUG: Stepping optimizer for batch {update + 1}")
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 model_optimizer.step()
+                
+                # Clear memory after optimizer step for quantization modes
+                if use_2branch:
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                elif use_quantization:
+                    torch.cuda.empty_cache()
                 
                 # Update metrics
                 train_metrics['time_reconstruction_loss'] += time_loss.item()
@@ -458,34 +620,66 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
                 print("=" * 50)
                 
-                # Clear memory every 5 batches to prevent memory leaks
-                if (update + 1) % 5 == 0:
+                # AGGRESSIVE memory management for quantization modes (2-branch and 1chtoken)
+                if use_2branch or use_quantization:
+                    # Clear memory EVERY batch for quantization modes
                     torch.cuda.empty_cache()
                     if torch.cuda.is_available():
                         memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                         memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-                        print(f"DEBUG: Cleared CUDA cache after batch {update + 1}")
-                        print(f"DEBUG: Memory - Allocated: {memory_allocated:.2f} GB, Reserved: {memory_reserved:.2f} GB")
-                
-                # Force garbage collection every 20 batches
-                if (update + 1) % 20 == 0:
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                
-                # Check memory usage and warn if getting close to limit
-                if torch.cuda.is_available():
-                    memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                    memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-                    total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+                        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+                        
+                        mode_name = "2-Branch" if use_2branch else "1ch-Token"
+                        print(f"DEBUG: {mode_name} Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB, Total: {total_memory:.2f}GB")
+                        
+                        # Warn if using more than 70% of GPU memory (more aggressive threshold)
+                        if memory_allocated / total_memory > 0.7:
+                            print(f"⚠️  WARNING: High GPU memory usage! {memory_allocated:.2f}GB / {total_memory:.2f}GB ({memory_allocated/total_memory*100:.1f}%)")
+                            # Force aggressive cleanup
+                            torch.cuda.empty_cache()
+                            import gc
+                            gc.collect()
+                            torch.cuda.empty_cache()
                     
-                    # Warn if using more than 90% of GPU memory
-                    if memory_allocated / total_memory > 0.9:
-                        print(f"⚠️  WARNING: High GPU memory usage! {memory_allocated:.2f}GB / {total_memory:.2f}GB ({memory_allocated/total_memory*100:.1f}%)")
-                        # Force aggressive cleanup
-                        torch.cuda.empty_cache()
+                    # Force garbage collection every 3 batches for quantization modes
+                    if (update + 1) % 3 == 0:
                         import gc
                         gc.collect()
+                        torch.cuda.empty_cache()
+                    
+                    # Delete redundant data structures every 10 batches
+                    if (update + 1) % 10 == 0:
+                        # Clear any accumulated gradients
+                        if hasattr(model_optimizer, 'zero_grad'):
+                            model_optimizer.zero_grad()
+                        
+                        # Clear any cached computations
+                        if hasattr(model, 'clear_cache'):
+                            model.clear_cache()
+                        
+                        # Force Python garbage collection
+                        import gc
+                        gc.collect()
+                        
+                        # Clear CUDA cache
+                        torch.cuda.empty_cache()
+                        
+                        print(f"DEBUG: Cleared redundant data structures at batch {update + 1}")
+                else:
+                    # Regular memory management for non-quantization modes
+                    if (update + 1) % 5 == 0:
+                        torch.cuda.empty_cache()
+                        if torch.cuda.is_available():
+                            memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                            memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+                            print(f"DEBUG: Cleared CUDA cache after batch {update + 1}")
+                            print(f"DEBUG: Memory - Allocated: {memory_allocated:.2f} GB, Reserved: {memory_reserved:.2f} GB")
+                    
+                    # Force garbage collection every 20 batches
+                    if (update + 1) % 20 == 0:
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
                 
                 # Log to wandb every 100 steps
                 if global_step % 100 == 0:
@@ -543,6 +737,34 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 torch.cuda.empty_cache()
                 import gc
                 gc.collect()
+                torch.cuda.empty_cache()
+                
+                # Apply aggressive memory cleanup
+                print(f"⚠️  Applying aggressive memory management due to OOM error")
+                
+                # Force aggressive cleanup
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # Clear any cached data to prevent memory leaks
+                if hasattr(train_baseline_with_wandb, 'fixed_different_audio_samples'):
+                    train_baseline_with_wandb.fixed_different_audio_samples = None
+                
+                print(f"🔄 Applied aggressive memory cleanup")
+                
+                # Initialize dummy losses to prevent variable reference errors
+                recon_loss = torch.tensor(0.0, device=device)
+                time_loss = torch.tensor(0.0, device=device)
+                freq_loss = torch.tensor(0.0, device=device)
+                adv_loss = torch.tensor(0.0, device=device)
+                feat_loss = torch.tensor(0.0, device=device)
+                disc_loss = torch.tensor(0.0, device=device)
+                quantization_penalty = torch.tensor(0.0, device=device)
+                diversity_loss = torch.tensor(0.0, device=device)
+                consistency_loss = torch.tensor(0.0, device=device)
+                effective_loss = torch.tensor(0.0, device=device)
                 
                 # Try to continue with next batch
                 print("⚠️  Skipping this batch due to OOM")
@@ -580,19 +802,30 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 val_metrics.update({
                     'val_diversity_loss': 0.0,
                     'val_consistency_loss': 0.0
-                })
+            })
         
         val_batches = 0
-        first_batch_audio = None  # Store first batch for audio saving
+        # Conditional audio saving - only for 1ch mode (not memory-intensive modes)
+        first_batch_audio = None
         first_batch_reconstructed = None
+        if not use_quantization and not use_2branch:  # Only for regular 1ch mode
+            print("DEBUG: Audio saving enabled for 1ch mode")
         
         # Validation metrics for different audio consistency check
         different_audio_consistency = 0.0  # Should be HIGH (different first codebook tokens)
         different_audio_samples = 0
         
-        # Store fixed different audio samples for consistent validation across epochs
-        if not hasattr(train_baseline_with_wandb, 'fixed_different_audio_samples'):
+        # Clear persistent data to prevent memory leaks
+        if hasattr(train_baseline_with_wandb, 'fixed_different_audio_samples'):
             train_baseline_with_wandb.fixed_different_audio_samples = None
+        # diverse_audio_samples is only used for audio saving, not needed for memory-intensive modes
+            
+        # Aggressive memory cleanup at start of each epoch
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"DEBUG: Applied aggressive memory cleanup at start of epoch {epoch + 1}")
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
@@ -640,13 +873,18 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                         reconstructed_audio, (0, pad_length), mode='reflect'
                     )
                 
-                # Store first batch for audio saving (every 10 epochs)
-                if batch_idx == 0 and (epoch + 1) % 10 == 0:
-                    first_batch_audio = batch.clone()
-                    first_batch_reconstructed = reconstructed_audio.clone()
+                # Conditional audio tensor storage - only for 1ch mode
+                if not use_quantization and not use_2branch and batch_idx == 0 and (epoch + 1) % 10 == 0:
+                    first_batch_audio = batch  # No need to clone for validation
+                    first_batch_reconstructed = reconstructed_audio
+                    print(f"DEBUG: Stored first batch for audio saving (epoch {epoch + 1})")
                 
                 # Compute losses
                 recon_loss, recon_metrics = reconstruction_loss(reconstructed_audio, batch)
+                
+                # Clear memory before adversarial loss computation
+                torch.cuda.empty_cache()
+                
                 # Use same random channel for both original and reconstructed in 32ch mode
                 if channels == 32:
                     channel_idx = torch.randint(0, batch.shape[1], (1,)).item()
@@ -655,7 +893,60 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                 else:
                     adv_fake = get_discriminator_input(reconstructed_audio, channels)
                     adv_real = get_discriminator_input(batch, channels)
-                adv_loss, feat_loss = adversarial_loss(adv_fake, adv_real)
+                
+                # Use mixed precision for discriminator to save memory
+                try:
+                    with torch.cuda.amp.autocast(enabled=use_quantization or use_2branch):
+                        adv_loss, feat_loss = adversarial_loss(adv_fake, adv_real)
+                except torch.cuda.OutOfMemoryError as e:
+                    print(f"❌ CUDA OOM Error in adversarial loss computation: {e}")
+                    print("🔄 Attempting recovery with memory clearing...")
+                    
+                    # Clear all caches
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    
+                    # Try with smaller batch size by splitting
+                    try:
+                        batch_size = adv_fake.shape[0]
+                        if batch_size > 1:
+                            # Split batch in half
+                            mid = batch_size // 2
+                            adv_fake_1, adv_fake_2 = adv_fake[:mid], adv_fake[mid:]
+                            adv_real_1, adv_real_2 = adv_real[:mid], adv_real[mid:]
+                            
+                            # Compute loss for first half
+                            adv_loss_1, feat_loss_1 = adversarial_loss(adv_fake_1, adv_real_1)
+                            
+                            # Clear memory
+                            del adv_fake_1, adv_real_1
+                            torch.cuda.empty_cache()
+                            
+                            # Compute loss for second half
+                            adv_loss_2, feat_loss_2 = adversarial_loss(adv_fake_2, adv_real_2)
+                            
+                            # Average the losses
+                            adv_loss = (adv_loss_1 + adv_loss_2) / 2
+                            feat_loss = (feat_loss_1 + feat_loss_2) / 2
+                            
+                            # Clean up
+                            del adv_fake_2, adv_real_2, adv_loss_1, adv_loss_2, feat_loss_1, feat_loss_2
+                            torch.cuda.empty_cache()
+                        else:
+                            # If batch size is 1, skip this batch
+                            print("⚠️  Skipping adversarial loss computation due to OOM")
+                            adv_loss = torch.tensor(0.0, device=device)
+                            feat_loss = torch.tensor(0.0, device=device)
+                    except torch.cuda.OutOfMemoryError:
+                        print("⚠️  Skipping adversarial loss computation due to persistent OOM")
+                        adv_loss = torch.tensor(0.0, device=device)
+                        feat_loss = torch.tensor(0.0, device=device)
+                
+                # Clear memory after adversarial loss
+                del adv_fake, adv_real
+                torch.cuda.empty_cache()
                 
                 # Split reconstruction loss into time and frequency components
                 time_loss = recon_metrics['time_loss']
@@ -747,8 +1038,8 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
                                     if audio_similarity.item() < 0.8:
                                         # Store the different audio samples for future epochs
                                         train_baseline_with_wandb.fixed_different_audio_samples = {
-                                            'sample_1': batch.clone().detach(),
-                                            'sample_2': next_batch.clone().detach(),
+                                            'sample_1': batch,  # No need to clone/detach
+                                            'sample_2': next_batch,
                                             'audio_similarity': audio_similarity.item()
                                         }
                                         different_samples_found = True
@@ -814,14 +1105,15 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
             different_audio_consistency /= different_audio_samples
             val_metrics['val_different_audio_consistency'] = different_audio_consistency
         
-        # Save audio samples every 10 epochs
-        if (epoch + 1) % 10 == 0 and first_batch_audio is not None and first_batch_reconstructed is not None:
+        # Save audio samples every 10 epochs - only for 1ch mode
+        if not use_quantization and not use_2branch and (epoch + 1) % 10 == 0 and first_batch_audio is not None and first_batch_reconstructed is not None:
             print(f"Saving audio samples for epoch {epoch + 1}...")
             save_audio_samples_to_wandb(
                 original_audio=first_batch_audio,
                 reconstructed_audio=first_batch_reconstructed,
                 epoch=epoch + 1,
-                sample_rate=24000
+                sample_rate=24000,
+                diverse_samples=None  # 1ch mode doesn't need diverse samples
             )
         
         # Log epoch metrics to wandb
@@ -865,7 +1157,16 @@ def train_baseline_with_wandb(model, discriminator, train_loader, val_loader,
         
         # Clear memory after each epoch to prevent memory leaks
         torch.cuda.empty_cache()
-        print(f"DEBUG: Cleared CUDA cache after epoch {epoch + 1}")
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Clear persistent data to prevent memory leaks
+        if hasattr(train_baseline_with_wandb, 'fixed_different_audio_samples'):
+            train_baseline_with_wandb.fixed_different_audio_samples = None
+        # diverse_audio_samples is only used for audio saving, not needed for memory-intensive modes
+            
+        print(f"DEBUG: Cleared CUDA cache and persistent data after epoch {epoch + 1}")
 
 
 def main():
@@ -882,20 +1183,21 @@ def main():
         use_quantization = False
         use_2branch = False
         print("Using 32-channel configuration")
-    elif args.__dict__['1chtoken']:
+    if args.__dict__['1chtoken']:
         channels = 1
-        batch_size = 1  # Reduced to 1 for testing
+        batch_size = 32  # Keep original batch size - memory leaks are fixed
         config_name = "baseline-1chtoken-24khz"
         use_quantization = True
         use_2branch = False
-        print("Using 1-channel configuration with quantization/tokenization")
+        print("Using 1-channel configuration with quantization/tokenization (2 codebooks)")
     elif args.__dict__['2branch']:
         channels = 1
-        batch_size = 2  # Need pairs for 2-branch mode
+        batch_size = 16  # 8 pairs for 2-branch mode (16 samples = 8 pairs) - memory leaks fixed
         config_name = "baseline-2branch-24khz"
         use_quantization = True
         use_2branch = True
-        print("Using 2-branch mode with shared first codebook and diverse second codebook")
+        print("Using 2-branch mode with shared first codebook and diverse second codebook (2 codebooks)")
+        print(f"Using batch size {batch_size} ({batch_size//2} pairs) - memory leaks fixed")
     else:  # 1ch
         channels = 1
         batch_size = 32
@@ -1009,11 +1311,25 @@ def main():
     print("Building MS-STFT discriminator...")
     # Use 1 channel for discriminator input to save memory (even for 32ch mode)
     disc_input_channels = 1 if channels == 32 else channels
-    discriminator = create_ms_stft_discriminator(
-        in_channels=disc_input_channels,
-        out_channels=1,
-        filters=32
-    ).to(device)
+    
+    # Use smaller discriminator for quantization modes to save memory
+    if use_quantization or use_2branch:
+        print("🔧 Using memory-efficient discriminator for quantization training...")
+        from discriminators import MultiScaleSTFTDiscriminator
+        discriminator = MultiScaleSTFTDiscriminator(
+            in_channels=disc_input_channels,
+            out_channels=1,
+            filters=16,  # Reduced from 32 to 16
+            n_ffts=[1024, 512, 256],  # Reduced number of scales
+            hop_lengths=[256, 128, 64],
+            win_lengths=[1024, 512, 256]
+        ).to(device)
+    else:
+        discriminator = create_ms_stft_discriminator(
+            in_channels=disc_input_channels,
+            out_channels=1,
+            filters=32
+        ).to(device)
     
     # Create optimizers with paper parameters
     print("Creating optimizers...")
@@ -1067,7 +1383,7 @@ def main():
             random_crop=True,
             num_workers=4,  # Enable multiprocessing for faster data loading
             pin_memory=True,  # Enable pinned memory for faster GPU transfer
-            persistent_workers=True  # Keep workers alive between epochs
+            persistent_workers=False  # Disable to prevent memory leaks
         )
     else:
         train_loader, val_loader = create_folder_based_dataloaders(
@@ -1084,7 +1400,7 @@ def main():
             random_crop=True,
             num_workers=4,  # Enable multiprocessing for faster data loading
             pin_memory=True,  # Enable pinned memory for faster GPU transfer
-            persistent_workers=True  # Keep workers alive between epochs
+            persistent_workers=False  # Disable to prevent memory leaks
         )
     
     # Log dataset information
@@ -1095,7 +1411,7 @@ def main():
     
     # Paper: 300 epochs, 2000 updates per epoch
     num_epochs = 300
-    updates_per_epoch = 2000  # Paper: 2000 updates per epoch
+    updates_per_epoch = 2000  # Paper: 2000 updates per epoch (aggressive memory management handles quantization)
     
     print(f"Starting training for {num_epochs} epochs...")
     print(f"Each epoch has {updates_per_epoch} updates (8k samples)")

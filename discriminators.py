@@ -198,14 +198,24 @@ class DiscriminatorSTFT(nn.Module):
         # Rearrange: (B, C, Freq, Time) -> (B, C, Time, Freq)
         z = rearrange(z, 'b c w t -> b c t w')
         
-        # Pass through convolutional layers
+        # Pass through convolutional layers with gradient checkpointing to save memory
         for i, layer in enumerate(self.convs):
-            z = layer(z)
+            if self.training and i > 0:  # Skip checkpointing for first layer
+                z = torch.utils.checkpoint.checkpoint(layer, z, use_reentrant=False)
+            else:
+                z = layer(z)
             z = self.activation(z)
             fmap.append(z)
+            
+            # Clear intermediate memory for large feature maps
+            if i % 2 == 0 and self.training:
+                torch.cuda.empty_cache()
         
         # Final output layer
-        z = self.conv_post(z)
+        if self.training:
+            z = torch.utils.checkpoint.checkpoint(self.conv_post, z, use_reentrant=False)
+        else:
+            z = self.conv_post(z)
         fmap.append(z)
         
         return z, fmap

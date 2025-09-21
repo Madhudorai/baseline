@@ -108,6 +108,43 @@ class AdversarialLoss(nn.Module):
 
         return loss
 
+    def train_adv_and_get_generator_loss(self, fake: torch.Tensor, real: torch.Tensor) -> tp.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Train the adversary and get generator losses in a single forward pass to save memory."""
+        # Get discriminator predictions once
+        all_logits_fake_is_fake, all_fmap_fake = self.get_adversary_pred(fake.detach())
+        all_logits_real_is_fake, all_fmap_real = self.get_adversary_pred(real.detach())
+        n_sub_adversaries = len(all_logits_fake_is_fake)
+        
+        # Compute discriminator loss
+        disc_loss = torch.tensor(0., device=fake.device)
+        for logit_fake_is_fake, logit_real_is_fake in zip(all_logits_fake_is_fake, all_logits_real_is_fake):
+            disc_loss += self.loss_fake(logit_fake_is_fake) + self.loss_real(logit_real_is_fake)
+        
+        if self.normalize:
+            disc_loss /= n_sub_adversaries
+
+        # Train discriminator
+        self.optimizer.zero_grad()
+        disc_loss.backward()
+        self.optimizer.step()
+        
+        # Compute generator losses (adversarial and feature matching)
+        adv_loss = torch.tensor(0., device=fake.device)
+        feat_loss = torch.tensor(0., device=fake.device)
+        
+        for logit_fake_is_fake in all_logits_fake_is_fake:
+            adv_loss += self.loss(logit_fake_is_fake)
+        
+        if self.loss_feat:
+            for fmap_fake, fmap_real in zip(all_fmap_fake, all_fmap_real):
+                feat_loss += self.loss_feat(fmap_fake, fmap_real)
+        
+        if self.normalize:
+            adv_loss /= n_sub_adversaries
+            feat_loss /= n_sub_adversaries
+        
+        return disc_loss, adv_loss, feat_loss
+
     def forward(self, fake: torch.Tensor, real: torch.Tensor) -> tp.Tuple[torch.Tensor, torch.Tensor]:
         """Return the loss for the generator, i.e. trying to fool the adversary,
         and feature matching loss if provided.
@@ -118,15 +155,25 @@ class AdversarialLoss(nn.Module):
         # Use eval mode for inference but don't block gradients
         self.adversary.eval()
         
-        # Don't use no_grad() - we need gradients to flow for the balancer
-        all_logits_fake_is_fake, all_fmap_fake = self.get_adversary_pred(fake)
-        all_logits_real_is_fake, all_fmap_real = self.get_adversary_pred(real)
-        n_sub_adversaries = len(all_logits_fake_is_fake)
-        for logit_fake_is_fake in all_logits_fake_is_fake:
-            adv += self.loss(logit_fake_is_fake)
-        if self.loss_feat:
-            for fmap_fake, fmap_real in zip(all_fmap_fake, all_fmap_real):
+        # Process discriminators one at a time to save memory
+        n_sub_adversaries = len(self.adversary.discriminators)
+        
+        for i, disc in enumerate(self.adversary.discriminators):
+            # Process fake and real through this discriminator
+            logit_fake, fmap_fake = disc(fake)
+            logit_real, fmap_real = disc(real)
+            
+            # Compute adversarial loss
+            adv += self.loss(logit_fake)
+            
+            # Compute feature matching loss if enabled
+            if self.loss_feat:
                 feat += self.loss_feat(fmap_fake, fmap_real)
+            
+            # Clear intermediate tensors to save memory
+            del logit_fake, logit_real, fmap_fake, fmap_real
+            if i % 2 == 0:  # Clear cache every other discriminator
+                torch.cuda.empty_cache()
 
         if self.normalize:
             adv /= n_sub_adversaries
