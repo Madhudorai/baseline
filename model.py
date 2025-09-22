@@ -325,27 +325,20 @@ class TwoBranchResidualVectorQuantization(nn.Module):
             first_codebook_2 = codes_pairs[:, 1, 0, :]  # [B//2, T] - first codebook, branch 2
             
             # Calculate consistency loss: encourage identical first codebook tokens
-            # Use MSE loss between first codebook indices
-            consistency_loss = F.mse_loss(first_codebook_1.float(), first_codebook_2.float()) * self.diversity_weight
+            # Use MSE loss between first codebook indices, normalized by sequence length
+            mse_loss = F.mse_loss(first_codebook_1.float(), first_codebook_2.float())
+            # Normalize by sequence length to get per-timestep loss
+            consistency_loss = mse_loss / first_codebook_1.shape[1] * self.diversity_weight
             
             # DIVERSITY LOSS: Ensure second codebook tokens are different between pairs
             second_codebook_1 = codes_pairs[:, 0, 1, :]  # [B//2, T] - second codebook, branch 1
             second_codebook_2 = codes_pairs[:, 1, 1, :]  # [B//2, T] - second codebook, branch 2
             
             # Calculate diversity loss: encourage different second codebook tokens
-            # Use negative cosine similarity to encourage diversity
-            second_codebook_1_flat = second_codebook_1.float().view(second_codebook_1.shape[0], -1)
-            second_codebook_2_flat = second_codebook_2.float().view(second_codebook_2.shape[0], -1)
-            
-            # Normalize for cosine similarity
-            second_codebook_1_norm = F.normalize(second_codebook_1_flat, p=2, dim=1)
-            second_codebook_2_norm = F.normalize(second_codebook_2_flat, p=2, dim=1)
-            
-            # Cosine similarity (we want this to be low for diversity)
-            cosine_sim = (second_codebook_1_norm * second_codebook_2_norm).sum(dim=1).mean()
-            
-            # Diversity loss: maximize negative cosine similarity
-            diversity_loss = -cosine_sim * self.diversity_weight
+            # Use normalized MSE loss between second codebook indices for stability
+            mse_diversity = F.mse_loss(second_codebook_1.float(), second_codebook_2.float())
+            # Normalize by sequence length and scale to reasonable range
+            diversity_loss = (mse_diversity / second_codebook_1.shape[1]) * self.diversity_weight
         
         return quantized_out, out_indices, out_losses, diversity_loss, consistency_loss
     
