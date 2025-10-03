@@ -222,6 +222,7 @@ class MultiScaleSTFTDiscriminator(MultiDiscriminator):
         n_ffts (Sequence[int]): FFT sizes for each scale [2048, 1024, 512, 256, 128]
         hop_lengths (Sequence[int]): Hop lengths for each scale
         win_lengths (Sequence[int]): Window sizes for each scale
+        sequential (bool): Whether to process discriminators sequentially (reduces memory usage)
         **kwargs: Additional args for DiscriminatorSTFT
     """
     def __init__(self, filters: int = 32, in_channels: int = 1, out_channels: int = 1, 
@@ -229,12 +230,14 @@ class MultiScaleSTFTDiscriminator(MultiDiscriminator):
                  n_ffts: tp.List[int] = [2048, 1024, 512, 256, 128], 
                  hop_lengths: tp.List[int] = [512, 256, 128, 64, 32],
                  win_lengths: tp.List[int] = [2048, 1024, 512, 256, 128], 
+                 sequential: bool = True,
                  **kwargs):
         super().__init__()
         
         assert len(n_ffts) == len(hop_lengths) == len(win_lengths)
         
         self.sep_channels = sep_channels
+        self.sequential = sequential
         
         # Create sub-discriminators for each scale
         self.discriminators = nn.ModuleList([
@@ -272,18 +275,41 @@ class MultiScaleSTFTDiscriminator(MultiDiscriminator):
         logits = []
         fmaps = []
         
-        for disc in self.discriminators:
-            logit, fmap = disc(x)
-            logits.append(logit)
-            fmaps.append(fmap)
+        if self.sequential:
+            # Process each discriminator sequentially to reduce CUDA memory usage
+            for i, disc in enumerate(self.discriminators):
+                # Process one discriminator at a time
+                logit, fmap = disc(x)
+                logits.append(logit)
+                fmaps.append(fmap)
+                
+                # Clear intermediate activations to free memory
+                # This helps reduce peak memory usage during sequential processing
+                if i < len(self.discriminators) - 1:  # Don't clear on last iteration
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        else:
+            # Process all discriminators in parallel (original behavior)
+            for disc in self.discriminators:
+                logit, fmap = disc(x)
+                logits.append(logit)
+                fmaps.append(fmap)
         
         return logits, fmaps
 
 
 # Convenience function to create MS-STFT discriminator with paper defaults
 def create_ms_stft_discriminator(in_channels: int = 1, out_channels: int = 1, 
-                                filters: int = 32, sep_channels: bool = False) -> MultiScaleSTFTDiscriminator:
-    """Create MS-STFT discriminator with EnCodec paper defaults."""
+                                filters: int = 32, sep_channels: bool = False,
+                                sequential: bool = True) -> MultiScaleSTFTDiscriminator:
+    """Create MS-STFT discriminator with EnCodec paper defaults.
+    
+    Args:
+        in_channels: Number of input channels
+        out_channels: Number of output channels
+        filters: Number of filters in convolutions
+        sep_channels: Whether to separate channels for stereo support
+        sequential: Whether to process discriminators sequentially (reduces memory usage)
+    """
     return MultiScaleSTFTDiscriminator(
         filters=filters,
         in_channels=in_channels,
@@ -291,5 +317,6 @@ def create_ms_stft_discriminator(in_channels: int = 1, out_channels: int = 1,
         sep_channels=sep_channels,
         n_ffts=[2048, 1024, 512, 256, 128],
         hop_lengths=[512, 256, 128, 64, 32],
-        win_lengths=[2048, 1024, 512, 256, 128]
+        win_lengths=[2048, 1024, 512, 256, 128],
+        sequential=sequential
     )
