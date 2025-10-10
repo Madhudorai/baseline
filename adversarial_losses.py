@@ -134,6 +134,41 @@ class AdversarialLoss(nn.Module):
 
         return adv, feat
 
+    def compute_losses_from_outputs(self, logits_real: tp.List[torch.Tensor], logits_fake: tp.List[torch.Tensor],
+                                   fmap_real: tp.List[tp.List[torch.Tensor]], fmap_fake: tp.List[tp.List[torch.Tensor]]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+        """Compute adversarial losses using pre-computed discriminator outputs.
+        
+        This avoids calling the discriminator again, saving memory.
+        
+        Args:
+            logits_real: Pre-computed logits for real samples
+            logits_fake: Pre-computed logits for fake samples  
+            fmap_real: Pre-computed feature maps for real samples
+            fmap_fake: Pre-computed feature maps for fake samples
+            
+        Returns:
+            adv: Adversarial loss for generator
+            feat: Feature matching loss
+        """
+        adv = torch.tensor(0., device=logits_fake[0].device)
+        feat = torch.tensor(0., device=logits_fake[0].device)
+        n_sub_adversaries = len(logits_fake)
+        
+        # Generator adversarial loss: try to fool discriminator
+        for logit_fake_is_fake in logits_fake:
+            adv += self.loss(logit_fake_is_fake)
+            
+        # Feature matching loss
+        if self.loss_feat:
+            for fmap_fake, fmap_real in zip(fmap_fake, fmap_real):
+                feat += self.loss_feat(fmap_fake, fmap_real)
+
+        if self.normalize:
+            adv /= n_sub_adversaries
+            feat /= n_sub_adversaries
+
+        return adv, feat
+
 
 def get_adv_criterion(loss_type: str) -> tp.Callable:
     """Get adversarial loss criterion for generator training."""
@@ -178,13 +213,17 @@ def mse_fake_loss(x: torch.Tensor) -> torch.Tensor:
 
 
 def hinge_real_loss(x: torch.Tensor) -> torch.Tensor:
-    """Hinge loss for real samples (discriminator should output > 1)."""
-    return -torch.mean(torch.min(x - 1, torch.tensor(0., device=x.device).expand_as(x)))
+    """Hinge loss for real samples: max(0, 1 - Dk(x)) as per paper."""
+    if x.numel() == 0:
+        return torch.tensor([0.0], device=x.device)
+    return torch.mean(torch.clamp(1 - x, min=0))
 
 
 def hinge_fake_loss(x: torch.Tensor) -> torch.Tensor:
-    """Hinge loss for fake samples (discriminator should output < -1)."""
-    return -torch.mean(torch.min(-x - 1, torch.tensor(0., device=x.device).expand_as(x)))
+    """Hinge loss for fake samples: max(0, 1 + Dk(x̂)) as per paper."""
+    if x.numel() == 0:
+        return torch.tensor([0.0], device=x.device)
+    return torch.mean(torch.clamp(1 + x, min=0))
 
 
 def mse_loss(x: torch.Tensor) -> torch.Tensor:
@@ -195,10 +234,10 @@ def mse_loss(x: torch.Tensor) -> torch.Tensor:
 
 
 def hinge_loss(x: torch.Tensor) -> torch.Tensor:
-    """Hinge loss for generator training (should fool discriminator to output > 0)."""
+    """Hinge loss for generator training: max(0, 1 - D(x̂)) as per paper."""
     if x.numel() == 0:
         return torch.tensor([0.0], device=x.device)
-    return -x.mean()
+    return torch.mean(torch.clamp(1 - x, min=0))
 
 
 def hinge2_loss(x: torch.Tensor) -> torch.Tensor:
@@ -221,19 +260,29 @@ class FeatureMatchingLoss(nn.Module):
         self.normalize = normalize
 
     def forward(self, fmap_fake: tp.List[torch.Tensor], fmap_real: tp.List[torch.Tensor]) -> torch.Tensor:
+        """
+        Feature matching loss as per paper equation (2):
+        ℓfeat(x, x̂) = 1/(KL) * Σ(k=1 to K) Σ(l=1 to L) (||Dk^l(x) - Dk^l(x̂)||₁ / mean(||Dk^l(x)||₁))
+        """
         assert len(fmap_fake) == len(fmap_real) and len(fmap_fake) > 0
         feat_loss = torch.tensor(0., device=fmap_fake[0].device)
-        feat_scale = torch.tensor(0., device=fmap_fake[0].device)
         n_fmaps = 0
+        
         for (feat_fake, feat_real) in zip(fmap_fake, fmap_real):
             assert feat_fake.shape == feat_real.shape
             n_fmaps += 1
-            # Normalize by real feature magnitude as per paper equation (2)
-            feat_scale = torch.mean(torch.abs(feat_real))
-            if feat_scale > 0:
-                feat_loss += self.loss(feat_fake, feat_real) / feat_scale
+            
+            # L1 norm of difference: ||Dk^l(x) - Dk^l(x̂)||₁
+            l1_diff = torch.mean(torch.abs(feat_fake - feat_real))
+            
+            # Mean L1 norm of real features: mean(||Dk^l(x)||₁)
+            l1_real = torch.mean(torch.abs(feat_real))
+            
+            # Relative feature matching loss: ||Dk^l(x) - Dk^l(x̂)||₁ / mean(||Dk^l(x)||₁)
+            if l1_real > 0:
+                feat_loss += l1_diff / l1_real
             else:
-                feat_loss += self.loss(feat_fake, feat_real)
+                feat_loss += l1_diff
 
         if self.normalize:
             feat_loss /= n_fmaps

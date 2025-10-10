@@ -458,7 +458,7 @@ def create_folder_based_dataloaders(audio_dir: str,
     
     if len(train_files) == 0:
         raise ValueError(f"No training files found in folders: {train_folders}")
-    if len(val_files) == 0:
+    if len(val_files) == 0 and len(val_folders) > 0:
         raise ValueError(f"No validation files found in folders: {val_folders}")
     
     # Filter files by duration if specified
@@ -468,7 +468,7 @@ def create_folder_based_dataloaders(audio_dir: str,
         
         if len(train_files) == 0:
             raise ValueError(f"No training files longer than {min_file_duration}s found")
-        if len(val_files) == 0:
+        if len(val_files) == 0 and len(val_folders) > 0:
             raise ValueError(f"No validation files longer than {min_file_duration}s found")
     
     print(f"Found {len(train_files)} training files from folders: {train_folders}")
@@ -510,15 +510,28 @@ def create_folder_based_dataloaders(audio_dir: str,
         drop_last=True
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,  # Don't shuffle validation data for consistent evaluation
-        num_workers=num_workers,
-        pin_memory=kwargs.get('pin_memory', False),
-        persistent_workers=kwargs.get('persistent_workers', False),
-        drop_last=True
-    )
+    # Only create validation dataloader if we have validation files
+    if len(val_files) > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,  # Don't shuffle validation data for consistent evaluation
+            num_workers=num_workers,
+            pin_memory=kwargs.get('pin_memory', False),
+            persistent_workers=kwargs.get('persistent_workers', False),
+            drop_last=True
+        )
+    else:
+        # Create empty dataloader for cases with no validation files
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,  # No workers for empty dataset
+            pin_memory=False,
+            persistent_workers=False,
+            drop_last=False  # Don't drop last for empty dataset
+        )
     
     return train_loader, val_loader
 

@@ -98,9 +98,15 @@ class Balancer:
         """
         norms = {}
         grads = {}
-        for name, loss in losses.items():
-            # Compute partial derivative of the loss with respect to the input.
-            grad, = autograd.grad(loss, [input], retain_graph=True)
+        
+        # Memory-efficient approach: compute gradients sequentially and clean up immediately
+        loss_items = list(losses.items())
+        for i, (name, loss) in enumerate(loss_items):
+            # Compute gradient for this specific loss
+            # Only retain graph if we have more losses to process
+            retain_graph = (i < len(loss_items) - 1)
+            grad, = autograd.grad(loss, [input], retain_graph=retain_graph, create_graph=False)
+            
             if self.per_batch_item:
                 # We do not average the gradient over the batch dimension.
                 dims = tuple(range(1, grad.dim()))
@@ -109,6 +115,10 @@ class Balancer:
                 norm = grad.norm(p=2)
             norms[name] = norm
             grads[name] = grad
+            
+            # Clear the loss tensor to free memory (it's no longer needed for gradients)
+            if i < len(loss_items) - 1:
+                del loss
 
         count = 1
         if self.per_batch_item:
@@ -136,8 +146,9 @@ class Balancer:
         effective_loss = torch.tensor(0., device=input.device, dtype=input.dtype)
         for name, avg_norm in avg_norms.items():
             if self.balance_grads:
-                # g_balanced = g / avg(||g||) * total_norm * desired_ratio
-                scale = desired_ratios[name] * self.total_norm / (self.epsilon + avg_norm)
+                # Paper equation (5): g̃i = R * (λi / Σj λj) * (gi / ⟨||gi||₂⟩β)
+                # This means: scale = R * (λi / Σj λj) / ⟨||gi||₂⟩β
+                scale = self.total_norm * desired_ratios[name] / (self.epsilon + avg_norm)
             else:
                 # We just do regular weighted sum of the gradients.
                 scale = self.weights[name]

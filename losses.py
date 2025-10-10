@@ -120,7 +120,7 @@ class MultiScaleMelSpectrogramLoss(nn.Module):
                                       n_mels=n_mels, sample_rate=sample_rate, f_min=f_min, f_max=f_max,
                                       log=True, normalized=normalized, floor_level=floor_level))
             if alphas:
-                self.alphas.append(np.sqrt(2 ** i - 1))
+                self.alphas.append(1)  # αi = 1
             else:
                 self.alphas.append(1)
             self.total += self.alphas[-1] + 1

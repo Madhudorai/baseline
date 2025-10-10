@@ -1,0 +1,13 @@
+# Core dependencies
+torch>=1.9.0
+torchaudio>=0.9.0
+numpy>=1.21.0
+soundfile>=0.10.0
+wandb>=0.12.0
+
+# Audio quality metrics
+torchmetrics>=0.8.0
+
+# Optional: for better performance
+librosa>=0.9.0
+scipy>=1.7.0

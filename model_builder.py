@@ -32,7 +32,7 @@ def build_encodec_model(sample_rate: int = 24000, channels: int = 32,
                            f"Supported: {list(model_ratios.keys())}")
         
         ratios = model_ratios[sample_rate]
-        frame_rate = sample_rate / np.prod(ratios)  # Should be ~25 Hz
+        frame_rate = sample_rate / np.prod(ratios)  # Actual frame rate depends on ratios
     
     # SEANet configuration
     seanet_kwargs = {
@@ -53,7 +53,7 @@ def build_encodec_model(sample_rate: int = 24000, channels: int = 32,
         "pad_mode": "reflect",
         "true_skip": True,
         "compress": 2,
-        "lstm": 0,
+        "lstm": 2, 
         "disable_norm_outer_blocks": 0,
     }
     

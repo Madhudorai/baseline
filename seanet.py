@@ -179,7 +179,7 @@ class SEANetEncoder(nn.Module):
             mult *= 2
 
         if lstm:
-            model += [StreamableLSTM(mult * n_filters, num_layers=lstm)]
+            model += [StreamableLSTM(mult * n_filters, mult * n_filters, num_layers=lstm)]
 
         model += [
             act(**activation_params),
@@ -225,7 +225,7 @@ class SEANetDecoder(nn.Module):
         ]
 
         if lstm:
-            model += [StreamableLSTM(mult * n_filters, num_layers=lstm)]
+            model += [StreamableLSTM(mult * n_filters, mult * n_filters, num_layers=lstm)]
 
         # Upsample to raw audio scale
         for i, ratio in enumerate(self.ratios):
